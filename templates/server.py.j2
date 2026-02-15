@@ -25,6 +25,7 @@ LIDARR_MODULES = os.environ.get("LIDARR_MODULES", "")
 LIDARR_READ_ONLY = os.environ.get("LIDARR_READ_ONLY", "false").lower() == "true"
 LIDARR_DEFAULT_QUALITY_PROFILE_ID = os.environ.get("LIDARR_DEFAULT_QUALITY_PROFILE_ID", "")
 LIDARR_DEFAULT_ROOT_FOLDER = os.environ.get("LIDARR_DEFAULT_ROOT_FOLDER", "")
+LIDARR_DEFAULT_MONITOR_OPTION = os.environ.get("LIDARR_DEFAULT_MONITOR_OPTION", "")
 
 # Parse enabled modules
 _enabled_modules: set[str] | None = None
@@ -119,21 +120,44 @@ def _normalize_unicode(text: str) -> str:
 # Response helpers
 # ---------------------------------------------------------------------------
 
+def _compact_value(v: Any) -> Any:
+    """Compact a single value for list-response auto-compaction."""
+    if isinstance(v, dict) and len(v) > 4:
+        if "id" in v:
+            return {"id": v["id"]}
+        return {"_keys": len(v)}
+    if isinstance(v, list) and v and isinstance(v[0], dict):
+        return f"[{len(v)} items]"
+    return v
+
+
+def _compact_object(row: dict[str, Any]) -> dict[str, Any]:
+    """Auto-compact nested objects in a single row."""
+    return {k: _compact_value(v) for k, v in row.items()}
+
+
 def _filter_response(
     data: list[dict[str, Any]],
     fields: str = "",
-    query: dict[str, Any] | None = None,
+    filter_expr: str = "",
 ) -> dict[str, Any]:
-    """Filter list response with field selection and row filtering."""
+    """Filter list response with field selection, row filtering, and auto-compaction."""
     result = data
-    if query:
-        result = [
-            row for row in result
-            if all(str(row.get(k)) == str(v) for k, v in query.items())
-        ]
+    if filter_expr:
+        for pair in filter_expr.split(","):
+            pair = pair.strip()
+            if "=" not in pair:
+                continue
+            k, v = pair.split("=", 1)
+            result = [
+                row for row in result
+                if str(row.get(k.strip())) == v.strip()
+            ]
     if fields:
         field_set = {f.strip() for f in fields.split(",")} | {"id"}
         result = [{k: v for k, v in row.items() if k in field_set} for row in result]
+    else:
+        result = [_compact_object(row) for row in result]
     return {"summary": f"Found {len(result)} items", "count": len(result), "data": result}
 
 
@@ -239,7 +263,7 @@ if _module_enabled("{{ tool.module }}"):
 {% endfor %}
 {% if tool.is_list %}
 {{ indent }}    fields: str = "",
-{{ indent }}    query: dict[str, Any] | None = None,
+{{ indent }}    filter: str = "",
 {% endif %}
 {% for p in optional_params %}
 {% if p.env_default is defined and p.env_default %}
@@ -266,6 +290,10 @@ if _module_enabled("{{ tool.module }}"):
 {{ indent }}    {{ p.name }}: {{ p.description }}
 {% endif %}
 {% endfor %}
+{% if tool.is_list %}
+{{ indent }}    fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+{{ indent }}    filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
+{% endif %}
 {{ indent }}    """
 {{ indent }}    if not confirm:
 {{ indent }}        return {"preview": "{{ tool.method | upper }} {{ tool.path }}", "confirm": "Set confirm=True to execute this {{ tool.method | upper }} request."}
@@ -276,7 +304,7 @@ if _module_enabled("{{ tool.module }}"):
 {% endfor %}
 {% if tool.is_list %}
 {{ indent }}    fields: str = "",
-{{ indent }}    query: dict[str, Any] | None = None,
+{{ indent }}    filter: str = "",
 {% endif %}
 {% for p in optional_params %}
 {% if p.env_default is defined and p.env_default %}
@@ -301,6 +329,10 @@ if _module_enabled("{{ tool.module }}"):
 {{ indent }}    {{ p.name }}: {{ p.description }}
 {% endif %}
 {% endfor %}
+{% if tool.is_list %}
+{{ indent }}    fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+{{ indent }}    filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
+{% endif %}
 {{ indent }}    """
 {% endif %}
 {% set path_params = tool.params | selectattr("location", "equalto", "path") | list %}
@@ -331,6 +363,10 @@ if _module_enabled("{{ tool.module }}"):
 {% endif %}
 {% endif %}
 {% endfor %}
+{% if tool.name == "lidarr_create_artist" %}
+{{ indent }}    if addOptions is None and LIDARR_DEFAULT_MONITOR_OPTION:
+{{ indent }}        addOptions = {"monitor": LIDARR_DEFAULT_MONITOR_OPTION, "searchForMissingAlbums": False}
+{% endif %}
 {% if query_params %}
 {{ indent }}    _params: dict[str, Any] = {}
 {% for p in query_params %}
@@ -392,11 +428,11 @@ if _module_enabled("{{ tool.module }}"):
 {{ indent }}        }
 {% if tool.is_list and tool.response_type == "array" %}
 {{ indent }}    if isinstance(_resp, list):
-{{ indent }}        return _filter_response(_resp, fields=fields, query=query)
+{{ indent }}        return _filter_response(_resp, fields=fields, filter_expr=filter)
 {% elif tool.is_list and tool.response_type == "paging" %}
 {{ indent }}    if isinstance(_resp, dict) and "records" in _resp:
 {{ indent }}        records = _resp["records"]
-{{ indent }}        filtered = _filter_response(records, fields=fields, query=query)
+{{ indent }}        filtered = _filter_response(records, fields=fields, filter_expr=filter)
 {{ indent }}        filtered["totalRecords"] = _resp.get("totalRecords", 0)
 {{ indent }}        filtered["page"] = _resp.get("page", 1)
 {{ indent }}        filtered["pageSize"] = _resp.get("pageSize", 10)

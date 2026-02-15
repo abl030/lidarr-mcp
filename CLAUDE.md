@@ -204,3 +204,33 @@ Status: SKIPPED — deferred indefinitely (cost-prohibitive for now).
 
 ### Sprint 5: Documentation & Release
 Status: COMPLETE — shipped as v0.1.0.
+
+### Issue #1: Response payloads too large for agent context windows
+Status: COMPLETE
+
+Goal: Fix real-world issues where list tool responses blow out LLM context windows.
+
+#### 1a — Auto-compact nested objects in list responses
+Added `_compact_value` and `_compact_object` helpers. When `fields` is NOT specified, list responses auto-compact:
+- Dict values with >4 keys → `{"id": <id>}` (or `{"_keys": N}` if no id)
+- List-of-dict values → `"[N items]"`
+- Small embedded objects (<=4 keys) kept as-is
+Single-object GETs are not affected — only list responses are compacted.
+
+#### 1b — Replace `query` dict with string-based `filter`
+Renamed `query: dict[str, Any] | None = None` → `filter: str = ""` in all list tool signatures. Format: `"key=value,key2=value2"`. Avoids pydantic `dict[str, Any]` serialization issues in MCP.
+
+#### 1c — Safer `create_artist` addOptions defaults
+Added `LIDARR_DEFAULT_MONITOR_OPTION` env var. When set and `addOptions is None`, injects `{"monitor": <value>, "searchForMissingAlbums": False}`. Updated workflow hint to document monitor values (all, future, missing, existing, latest, first, none).
+
+#### 1d — Docstring improvements for list tools
+Added `fields` and `filter` documentation to all list tool docstrings.
+
+Deliverables:
+- `templates/server.py.j2`: `_compact_value`/`_compact_object` helpers, rewritten `_filter_response` with auto-compaction and filter string parsing, `query` → `filter` rename, `LIDARR_DEFAULT_MONITOR_OPTION` env var and addOptions injection, list tool docstring enhancements.
+- `generator/context_builder.py`: Updated `_WORKFLOW_HINTS["lidarr_create_artist"]` with addOptions.monitor documentation.
+- `tests/test_issue1.py`: 13 new unit tests covering compaction, filter parsing, and generated code assertions.
+- `tests/test_generator.py`: Updated `query` → `filter` assertion.
+- `tests/test_integration.py`: Updated `query=` → `filter=` in 2 places.
+- `generated/server.py`: Regenerated with all changes.
+- Total tests: 120 (100 unit + 20 integration).

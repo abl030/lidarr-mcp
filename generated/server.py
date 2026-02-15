@@ -25,6 +25,7 @@ LIDARR_MODULES = os.environ.get("LIDARR_MODULES", "")
 LIDARR_READ_ONLY = os.environ.get("LIDARR_READ_ONLY", "false").lower() == "true"
 LIDARR_DEFAULT_QUALITY_PROFILE_ID = os.environ.get("LIDARR_DEFAULT_QUALITY_PROFILE_ID", "")
 LIDARR_DEFAULT_ROOT_FOLDER = os.environ.get("LIDARR_DEFAULT_ROOT_FOLDER", "")
+LIDARR_DEFAULT_MONITOR_OPTION = os.environ.get("LIDARR_DEFAULT_MONITOR_OPTION", "")
 
 # Parse enabled modules
 _enabled_modules: set[str] | None = None
@@ -119,21 +120,44 @@ def _normalize_unicode(text: str) -> str:
 # Response helpers
 # ---------------------------------------------------------------------------
 
+def _compact_value(v: Any) -> Any:
+    """Compact a single value for list-response auto-compaction."""
+    if isinstance(v, dict) and len(v) > 4:
+        if "id" in v:
+            return {"id": v["id"]}
+        return {"_keys": len(v)}
+    if isinstance(v, list) and v and isinstance(v[0], dict):
+        return f"[{len(v)} items]"
+    return v
+
+
+def _compact_object(row: dict[str, Any]) -> dict[str, Any]:
+    """Auto-compact nested objects in a single row."""
+    return {k: _compact_value(v) for k, v in row.items()}
+
+
 def _filter_response(
     data: list[dict[str, Any]],
     fields: str = "",
-    query: dict[str, Any] | None = None,
+    filter_expr: str = "",
 ) -> dict[str, Any]:
-    """Filter list response with field selection and row filtering."""
+    """Filter list response with field selection, row filtering, and auto-compaction."""
     result = data
-    if query:
-        result = [
-            row for row in result
-            if all(str(row.get(k)) == str(v) for k, v in query.items())
-        ]
+    if filter_expr:
+        for pair in filter_expr.split(","):
+            pair = pair.strip()
+            if "=" not in pair:
+                continue
+            k, v = pair.split("=", 1)
+            result = [
+                row for row in result
+                if str(row.get(k.strip())) == v.strip()
+            ]
     if fields:
         field_set = {f.strip() for f in fields.split(",")} | {"id"}
         result = [{k: v for k, v in row.items() if k in field_set} for row in result]
+    else:
+        result = [_compact_object(row) for row in result]
     return {"summary": f"Found {len(result)} items", "count": len(result), "data": result}
 
 
@@ -223,7 +247,7 @@ if _module_enabled("album"):
     @mcp.tool()
     async def lidarr_list_albums(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         artistId: int | None = None,
         albumIds: list[int] | None = None,
         foreignAlbumId: str | None = None,
@@ -231,6 +255,8 @@ if _module_enabled("album"):
     ) -> dict[str, Any] | list[Any] | str:
         """List albums. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/album"
         _params: dict[str, Any] = {}
@@ -265,7 +291,7 @@ if _module_enabled("album"):
                 "tool": "lidarr_list_albums",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("album"):
@@ -385,11 +411,13 @@ if _module_enabled("album"):
     @mcp.tool()
     async def lidarr_lookup_album(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         term: str | None = None,
     ) -> dict[str, Any] | list[Any] | str:
         """Lookup album. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/album/lookup"
         if term is not None:
@@ -420,7 +448,7 @@ if _module_enabled("album"):
                 "tool": "lidarr_lookup_album",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("album"):
@@ -715,11 +743,13 @@ if _module_enabled("artist"):
     @mcp.tool()
     async def lidarr_list_artists(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         mbId: str | None = None,
     ) -> dict[str, Any] | list[Any] | str:
         """List artists. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/artist"
         _params: dict[str, Any] = {}
@@ -748,7 +778,7 @@ if _module_enabled("artist"):
                 "tool": "lidarr_list_artists",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("artist"):
@@ -789,7 +819,7 @@ if _module_enabled("artist"):
             statistics: dict | None = None,
             confirm: bool = False,
         ) -> dict[str, Any] | list[Any] | str:
-            """Create artist If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_search_tools with 'command' to find album search commands after adding.
+            """Create artist If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_search_tools with 'command' to find album search commands after adding. Set addOptions.monitor to control which albums are monitored: 'all', 'future', 'missing', 'existing', 'latest', 'first', or 'none'. Default monitors entire discography.
 
             Requires confirm=True to execute. Set confirm=False to preview.
             status: Values: continuing, ended, deleted
@@ -805,6 +835,8 @@ if _module_enabled("artist"):
                 qualityProfileId = int(LIDARR_DEFAULT_QUALITY_PROFILE_ID)
             if rootFolderPath is None and LIDARR_DEFAULT_ROOT_FOLDER:
                 rootFolderPath = LIDARR_DEFAULT_ROOT_FOLDER
+            if addOptions is None and LIDARR_DEFAULT_MONITOR_OPTION:
+                addOptions = {"monitor": LIDARR_DEFAULT_MONITOR_OPTION, "searchForMissingAlbums": False}
             _body: dict[str, Any] = {}
             if status is not None:
                 _body["status"] = status
@@ -1045,11 +1077,13 @@ if _module_enabled("artist"):
     @mcp.tool()
     async def lidarr_lookup_artist(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         term: str | None = None,
     ) -> dict[str, Any] | list[Any] | str:
         """Lookup artist. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/artist/lookup"
         if term is not None:
@@ -1080,7 +1114,7 @@ if _module_enabled("artist"):
                 "tool": "lidarr_lookup_artist",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("artist"):
@@ -1310,10 +1344,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_autotagging(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List autotagging. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/autotagging"
         try:
@@ -1338,7 +1374,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_autotagging",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -1554,7 +1590,7 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_blocklist(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         page: int = 1,
         pageSize: int = 10,
         sortKey: str | None = None,
@@ -1563,6 +1599,8 @@ if _module_enabled("system"):
         """List blocklist. Returns paginated results. If unexpected errors occur, call lidarr_report_issue.
 
         sortDirection: Values: default, ascending, descending
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/blocklist"
         _params: dict[str, Any] = {}
@@ -1598,7 +1636,7 @@ if _module_enabled("system"):
             }
         if isinstance(_resp, dict) and "records" in _resp:
             records = _resp["records"]
-            filtered = _filter_response(records, fields=fields, query=query)
+            filtered = _filter_response(records, fields=fields, filter_expr=filter)
             filtered["totalRecords"] = _resp.get("totalRecords", 0)
             filtered["page"] = _resp.get("page", 1)
             filtered["pageSize"] = _resp.get("pageSize", 10)
@@ -1690,7 +1728,7 @@ if _module_enabled("calendar"):
     @mcp.tool()
     async def lidarr_list_calendar(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         start: str | None = None,
         end: str | None = None,
         unmonitored: bool = False,
@@ -1699,6 +1737,8 @@ if _module_enabled("calendar"):
     ) -> dict[str, Any] | list[Any] | str:
         """List calendar. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/calendar"
         _params: dict[str, Any] = {}
@@ -1735,7 +1775,7 @@ if _module_enabled("calendar"):
                 "tool": "lidarr_list_calendar",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("calendar"):
@@ -1776,10 +1816,12 @@ if _module_enabled("command"):
     @mcp.tool()
     async def lidarr_list_commands(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List commands. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/command"
         try:
@@ -1804,7 +1846,7 @@ if _module_enabled("command"):
                 "tool": "lidarr_list_commands",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("command"):
@@ -3089,10 +3131,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_custom_filters(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List custom filters. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/customfilter"
         try:
@@ -3117,7 +3161,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_custom_filters",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -3295,10 +3339,12 @@ if _module_enabled("quality"):
     @mcp.tool()
     async def lidarr_list_custom_formats(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List custom formats. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/customformat"
         try:
@@ -3323,7 +3369,7 @@ if _module_enabled("quality"):
                 "tool": "lidarr_list_custom_formats",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("quality"):
@@ -3623,10 +3669,12 @@ if _module_enabled("quality"):
     @mcp.tool()
     async def lidarr_list_delay_profiles(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List delay profiles. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/delayprofile"
         try:
@@ -3651,7 +3699,7 @@ if _module_enabled("quality"):
                 "tool": "lidarr_list_delay_profiles",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("quality"):
@@ -3914,10 +3962,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_diskspace(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List diskspace. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/diskspace"
         try:
@@ -3942,7 +3992,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_diskspace",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("downloadclient"):
@@ -3950,10 +4000,12 @@ if _module_enabled("downloadclient"):
     @mcp.tool()
     async def lidarr_list_download_clients(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List download clients. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/downloadclient"
         try:
@@ -3978,7 +4030,7 @@ if _module_enabled("downloadclient"):
                 "tool": "lidarr_list_download_clients",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("downloadclient"):
@@ -4279,10 +4331,12 @@ if _module_enabled("downloadclient"):
     @mcp.tool()
     async def lidarr_list_download_clients_schema(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List download clients schema. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/downloadclient/schema"
         try:
@@ -4307,7 +4361,7 @@ if _module_enabled("downloadclient"):
                 "tool": "lidarr_list_download_clients_schema",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("downloadclient"):
@@ -4719,10 +4773,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_health(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List health. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/health"
         try:
@@ -4747,7 +4803,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_health",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("history"):
@@ -4755,7 +4811,7 @@ if _module_enabled("history"):
     @mcp.tool()
     async def lidarr_list_history(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         page: int = 1,
         pageSize: int = 10,
         sortKey: str | None = None,
@@ -4772,6 +4828,8 @@ if _module_enabled("history"):
         """List history. Returns paginated results. If unexpected errors occur, call lidarr_report_issue.
 
         sortDirection: Values: default, ascending, descending
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/history"
         _params: dict[str, Any] = {}
@@ -4823,7 +4881,7 @@ if _module_enabled("history"):
             }
         if isinstance(_resp, dict) and "records" in _resp:
             records = _resp["records"]
-            filtered = _filter_response(records, fields=fields, query=query)
+            filtered = _filter_response(records, fields=fields, filter_expr=filter)
             filtered["totalRecords"] = _resp.get("totalRecords", 0)
             filtered["page"] = _resp.get("page", 1)
             filtered["pageSize"] = _resp.get("pageSize", 10)
@@ -4835,7 +4893,7 @@ if _module_enabled("history"):
     @mcp.tool()
     async def lidarr_list_history_artist(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         artistId: int | None = None,
         albumId: int | None = None,
         eventType: str | None = None,
@@ -4846,6 +4904,8 @@ if _module_enabled("history"):
         """List history artist. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
         eventType: Values: unknown, grabbed, artistFolderImported, trackFileImported, downloadFailed, trackFileDeleted, trackFileRenamed, albumImportIncomplete, downloadImported, trackFileRetagged, downloadIgnored
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/history/artist"
         _params: dict[str, Any] = {}
@@ -4884,7 +4944,7 @@ if _module_enabled("history"):
                 "tool": "lidarr_list_history_artist",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("history"):
@@ -4930,7 +4990,7 @@ if _module_enabled("history"):
     @mcp.tool()
     async def lidarr_list_history_since(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         date: str | None = None,
         eventType: str | None = None,
         includeArtist: bool = False,
@@ -4940,6 +5000,8 @@ if _module_enabled("history"):
         """List history since. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
         eventType: Values: unknown, grabbed, artistFolderImported, trackFileImported, downloadFailed, trackFileDeleted, trackFileRenamed, albumImportIncomplete, downloadImported, trackFileRetagged, downloadIgnored
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/history/since"
         _params: dict[str, Any] = {}
@@ -4976,7 +5038,7 @@ if _module_enabled("history"):
                 "tool": "lidarr_list_history_since",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("importlist"):
@@ -4984,10 +5046,12 @@ if _module_enabled("importlist"):
     @mcp.tool()
     async def lidarr_list_import_lists(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List import lists. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/importlist"
         try:
@@ -5012,7 +5076,7 @@ if _module_enabled("importlist"):
                 "tool": "lidarr_list_import_lists",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("importlist"):
@@ -5347,10 +5411,12 @@ if _module_enabled("importlist"):
     @mcp.tool()
     async def lidarr_list_import_lists_schema(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List import lists schema. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/importlist/schema"
         try:
@@ -5375,7 +5441,7 @@ if _module_enabled("importlist"):
                 "tool": "lidarr_list_import_lists_schema",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("importlist"):
@@ -5710,10 +5776,12 @@ if _module_enabled("importlist"):
     @mcp.tool()
     async def lidarr_list_import_list_exclusions(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List import list exclusions. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/importlistexclusion"
         try:
@@ -5738,7 +5806,7 @@ if _module_enabled("importlist"):
                 "tool": "lidarr_list_import_list_exclusions",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("importlist"):
@@ -5908,10 +5976,12 @@ if _module_enabled("indexer"):
     @mcp.tool()
     async def lidarr_list_indexers(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List indexers. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/indexer"
         try:
@@ -5936,7 +6006,7 @@ if _module_enabled("indexer"):
                 "tool": "lidarr_list_indexers",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("indexer"):
@@ -6255,10 +6325,12 @@ if _module_enabled("indexer"):
     @mcp.tool()
     async def lidarr_list_indexers_schema(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List indexers schema. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/indexer/schema"
         try:
@@ -6283,7 +6355,7 @@ if _module_enabled("indexer"):
                 "tool": "lidarr_list_indexers_schema",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("indexer"):
@@ -6596,10 +6668,12 @@ if _module_enabled("indexer"):
     @mcp.tool()
     async def lidarr_list_indexer_flags(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List indexer flags. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/indexerflag"
         try:
@@ -6624,7 +6698,7 @@ if _module_enabled("indexer"):
                 "tool": "lidarr_list_indexer_flags",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -6632,10 +6706,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_languages(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List languages. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/language"
         try:
@@ -6660,7 +6736,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_languages",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -6733,7 +6809,7 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_logs(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         page: int = 1,
         pageSize: int = 10,
         sortKey: str | None = None,
@@ -6743,6 +6819,8 @@ if _module_enabled("system"):
         """List logs. Returns paginated results. If unexpected errors occur, call lidarr_report_issue.
 
         sortDirection: Values: default, ascending, descending
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/log"
         _params: dict[str, Any] = {}
@@ -6780,7 +6858,7 @@ if _module_enabled("system"):
             }
         if isinstance(_resp, dict) and "records" in _resp:
             records = _resp["records"]
-            filtered = _filter_response(records, fields=fields, query=query)
+            filtered = _filter_response(records, fields=fields, filter_expr=filter)
             filtered["totalRecords"] = _resp.get("totalRecords", 0)
             filtered["page"] = _resp.get("page", 1)
             filtered["pageSize"] = _resp.get("pageSize", 10)
@@ -6792,10 +6870,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_logs_file(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List logs file. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/log/file"
         try:
@@ -6820,7 +6900,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_logs_file",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -6828,10 +6908,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_logs_file_update(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List logs file update. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/log/file/update"
         try:
@@ -6856,7 +6938,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_logs_file_update",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -6930,7 +7012,7 @@ if _module_enabled("command"):
     @mcp.tool()
     async def lidarr_list_manual_import(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         folder: str | None = None,
         downloadId: str | None = None,
         artistId: int | None = None,
@@ -6939,6 +7021,8 @@ if _module_enabled("command"):
     ) -> dict[str, Any] | list[Any] | str:
         """List manual import. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/manualimport"
         _params: dict[str, Any] = {}
@@ -6975,7 +7059,7 @@ if _module_enabled("command"):
                 "tool": "lidarr_list_manual_import",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("command"):
@@ -7093,10 +7177,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_metadata(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List metadata. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/metadata"
         try:
@@ -7121,7 +7207,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_metadata",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -7274,10 +7360,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_metadata_schema(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List metadata schema. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/metadata/schema"
         try:
@@ -7302,7 +7390,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_metadata_schema",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -7571,10 +7659,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_metadata_profiles(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List metadata profiles. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/metadataprofile"
         try:
@@ -7599,7 +7689,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_metadata_profiles",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -7819,10 +7909,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_notifications(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List notifications. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/notification"
         try:
@@ -7847,7 +7939,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_notifications",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -8168,10 +8260,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_notifications_schema(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List notifications schema. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/notification/schema"
         try:
@@ -8196,7 +8290,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_notifications_schema",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -8670,10 +8764,12 @@ if _module_enabled("quality"):
     @mcp.tool()
     async def lidarr_list_quality_definitions(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List quality definitions. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/qualitydefinition"
         try:
@@ -8698,7 +8794,7 @@ if _module_enabled("quality"):
                 "tool": "lidarr_list_quality_definitions",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("quality"):
@@ -8839,10 +8935,12 @@ if _module_enabled("quality"):
     @mcp.tool()
     async def lidarr_list_quality_profiles(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List quality profiles. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/qualityprofile"
         try:
@@ -8867,7 +8965,7 @@ if _module_enabled("quality"):
                 "tool": "lidarr_list_quality_profiles",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("quality"):
@@ -9103,7 +9201,7 @@ if _module_enabled("queue"):
     @mcp.tool()
     async def lidarr_list_queue(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         page: int = 1,
         pageSize: int = 10,
         sortKey: str | None = None,
@@ -9119,6 +9217,8 @@ if _module_enabled("queue"):
 
         sortDirection: Values: default, ascending, descending
         protocol: Values: unknown, usenet, torrent
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/queue"
         _params: dict[str, Any] = {}
@@ -9166,7 +9266,7 @@ if _module_enabled("queue"):
             }
         if isinstance(_resp, dict) and "records" in _resp:
             records = _resp["records"]
-            filtered = _filter_response(records, fields=fields, query=query)
+            filtered = _filter_response(records, fields=fields, filter_expr=filter)
             filtered["totalRecords"] = _resp.get("totalRecords", 0)
             filtered["page"] = _resp.get("page", 1)
             filtered["pageSize"] = _resp.get("pageSize", 10)
@@ -9234,7 +9334,7 @@ if _module_enabled("queue"):
     @mcp.tool()
     async def lidarr_list_queue_details(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         artistId: int | None = None,
         albumIds: list[int] | None = None,
         includeArtist: bool = False,
@@ -9242,6 +9342,8 @@ if _module_enabled("queue"):
     ) -> dict[str, Any] | list[Any] | str:
         """List queue details. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/queue/details"
         _params: dict[str, Any] = {}
@@ -9276,7 +9378,7 @@ if _module_enabled("queue"):
                 "tool": "lidarr_list_queue_details",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("queue"):
@@ -9448,12 +9550,14 @@ if _module_enabled("release"):
     @mcp.tool()
     async def lidarr_list_releases(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         albumId: int | None = None,
         artistId: int | None = None,
     ) -> dict[str, Any] | list[Any] | str:
         """List releases. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/release"
         _params: dict[str, Any] = {}
@@ -9484,7 +9588,7 @@ if _module_enabled("release"):
                 "tool": "lidarr_list_releases",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("release"):
@@ -9814,10 +9918,12 @@ if _module_enabled("release"):
     @mcp.tool()
     async def lidarr_list_release_profiles(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List release profiles. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/releaseprofile"
         try:
@@ -9842,7 +9948,7 @@ if _module_enabled("release"):
                 "tool": "lidarr_list_release_profiles",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("release"):
@@ -10030,10 +10136,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_remote_path_mappings(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List remote path mappings. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/remotepathmapping"
         try:
@@ -10058,7 +10166,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_remote_path_mappings",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -10234,12 +10342,14 @@ if _module_enabled("command"):
     @mcp.tool()
     async def lidarr_list_rename(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         artistId: int | None = None,
         albumId: int | None = None,
     ) -> dict[str, Any] | list[Any] | str:
         """List rename. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/rename"
         _params: dict[str, Any] = {}
@@ -10270,7 +10380,7 @@ if _module_enabled("command"):
                 "tool": "lidarr_list_rename",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("command"):
@@ -10278,12 +10388,14 @@ if _module_enabled("command"):
     @mcp.tool()
     async def lidarr_list_retag(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         artistId: int | None = None,
         albumId: int | None = None,
     ) -> dict[str, Any] | list[Any] | str:
         """List retag. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/retag"
         _params: dict[str, Any] = {}
@@ -10314,7 +10426,7 @@ if _module_enabled("command"):
                 "tool": "lidarr_list_retag",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -10322,10 +10434,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_root_folders(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List root folders. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/rootfolder"
         try:
@@ -10350,7 +10464,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_root_folders",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -10572,11 +10686,13 @@ if _module_enabled("artist"):
     @mcp.tool()
     async def lidarr_list_search(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         term: str | None = None,
     ) -> dict[str, Any] | list[Any] | str:
         """List search. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/search"
         _params: dict[str, Any] = {}
@@ -10605,7 +10721,7 @@ if _module_enabled("artist"):
                 "tool": "lidarr_list_search",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -10613,10 +10729,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_system_backup(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List system backup. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/system/backup"
         try:
@@ -10641,7 +10759,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_system_backup",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -10932,10 +11050,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_system_task(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List system task. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/system/task"
         try:
@@ -10960,7 +11080,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_system_task",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -11001,10 +11121,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_tags(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List tags. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/tag"
         try:
@@ -11029,7 +11151,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_tags",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -11079,10 +11201,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_tags_detail(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List tags detail. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/tag/detail"
         try:
@@ -11107,7 +11231,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_tags_detail",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("system"):
@@ -11262,7 +11386,7 @@ if _module_enabled("track"):
     @mcp.tool()
     async def lidarr_list_tracks(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         artistId: int | None = None,
         albumId: int | None = None,
         albumReleaseId: int | None = None,
@@ -11270,6 +11394,8 @@ if _module_enabled("track"):
     ) -> dict[str, Any] | list[Any] | str:
         """List tracks. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/track"
         _params: dict[str, Any] = {}
@@ -11304,7 +11430,7 @@ if _module_enabled("track"):
                 "tool": "lidarr_list_tracks",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("track"):
@@ -11345,7 +11471,7 @@ if _module_enabled("track"):
     @mcp.tool()
     async def lidarr_list_track_files(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         artistId: int | None = None,
         trackFileIds: list[int] | None = None,
         albumId: list[int] | None = None,
@@ -11353,6 +11479,8 @@ if _module_enabled("track"):
     ) -> dict[str, Any] | list[Any] | str:
         """List track files. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/trackfile"
         _params: dict[str, Any] = {}
@@ -11387,7 +11515,7 @@ if _module_enabled("track"):
                 "tool": "lidarr_list_track_files",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("track"):
@@ -11654,10 +11782,12 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_list_updates(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """List updates. Returns a list. If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/update"
         try:
@@ -11682,7 +11812,7 @@ if _module_enabled("system"):
                 "tool": "lidarr_list_updates",
             }
         if isinstance(_resp, list):
-            return _filter_response(_resp, fields=fields, query=query)
+            return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
 
 if _module_enabled("wanted"):
@@ -11690,7 +11820,7 @@ if _module_enabled("wanted"):
     @mcp.tool()
     async def lidarr_list_wanted_cutoff(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         page: int = 1,
         pageSize: int = 10,
         sortKey: str | None = None,
@@ -11701,6 +11831,8 @@ if _module_enabled("wanted"):
         """List wanted cutoff. Returns paginated results. If unexpected errors occur, call lidarr_report_issue.
 
         sortDirection: Values: default, ascending, descending
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/wanted/cutoff"
         _params: dict[str, Any] = {}
@@ -11740,7 +11872,7 @@ if _module_enabled("wanted"):
             }
         if isinstance(_resp, dict) and "records" in _resp:
             records = _resp["records"]
-            filtered = _filter_response(records, fields=fields, query=query)
+            filtered = _filter_response(records, fields=fields, filter_expr=filter)
             filtered["totalRecords"] = _resp.get("totalRecords", 0)
             filtered["page"] = _resp.get("page", 1)
             filtered["pageSize"] = _resp.get("pageSize", 10)
@@ -11785,7 +11917,7 @@ if _module_enabled("wanted"):
     @mcp.tool()
     async def lidarr_list_wanted_missing(
         fields: str = "",
-        query: dict[str, Any] | None = None,
+        filter: str = "",
         page: int = 1,
         pageSize: int = 10,
         sortKey: str | None = None,
@@ -11796,6 +11928,8 @@ if _module_enabled("wanted"):
         """List wanted missing. Returns paginated results. If unexpected errors occur, call lidarr_report_issue.
 
         sortDirection: Values: default, ascending, descending
+        fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
+        filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
         """
         _path = "/api/v1/wanted/missing"
         _params: dict[str, Any] = {}
@@ -11835,7 +11969,7 @@ if _module_enabled("wanted"):
             }
         if isinstance(_resp, dict) and "records" in _resp:
             records = _resp["records"]
-            filtered = _filter_response(records, fields=fields, query=query)
+            filtered = _filter_response(records, fields=fields, filter_expr=filter)
             filtered["totalRecords"] = _resp.get("totalRecords", 0)
             filtered["page"] = _resp.get("page", 1)
             filtered["pageSize"] = _resp.get("pageSize", 10)

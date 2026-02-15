@@ -199,7 +199,7 @@ def test_list_tools_have_filter_params():
         func_end = content.find(") ->", match.start())
         func_sig = content[match.start():func_end]
         assert "fields" in func_sig
-        assert "query" in func_sig
+        assert "filter" in func_sig
 
 
 def test_always_registered_tools_present():

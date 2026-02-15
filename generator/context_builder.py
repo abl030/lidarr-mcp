@@ -72,7 +72,9 @@ _MUTATION_METHODS = {"post", "put", "patch", "delete"}
 _WORKFLOW_HINTS: dict[str, str] = {
     "lidarr_create_artist": (
         "Note: Call lidarr_search_tools with 'command' to find album search"
-        " commands after adding."
+        " commands after adding. Set addOptions.monitor to control which albums"
+        " are monitored: 'all', 'future', 'missing', 'existing', 'latest',"
+        " 'first', or 'none'. Default monitors entire discography."
     ),
     "lidarr_monitor_album": (
         "Note: Call lidarr_create_command with name='AlbumSearch' to trigger"

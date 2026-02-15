@@ -148,8 +148,8 @@ async def test_fields_restricts_keys(server: ModuleType) -> None:
         assert set(row.keys()) <= {"id", "name"}
 
 
-async def test_query_filters_rows(server: ModuleType) -> None:
-    """Passing query= should filter rows to only matching ones."""
+async def test_filter_filters_rows(server: ModuleType) -> None:
+    """Passing filter= should filter rows to only matching ones."""
     # Get all quality profiles first
     all_profiles = await server.lidarr_list_quality_profiles()
     if all_profiles["count"] == 0:
@@ -157,7 +157,7 @@ async def test_query_filters_rows(server: ModuleType) -> None:
 
     first_name = all_profiles["data"][0]["name"]
     filtered = await server.lidarr_list_quality_profiles(
-        query={"name": first_name},
+        filter=f"name={first_name}",
     )
     assert isinstance(filtered, dict)
     assert filtered["count"] >= 1
@@ -209,7 +209,7 @@ async def test_crud_artist_lifecycle(server: ModuleType) -> None:
     assert foreign_id, "Expected a foreignArtistId from lookup"
 
     # Clean up any leftover artist from a previous failed run
-    existing = await server.lidarr_list_artists(query={"foreignArtistId": foreign_id})
+    existing = await server.lidarr_list_artists(filter=f"foreignArtistId={foreign_id}")
     if isinstance(existing, dict) and existing.get("count", 0) > 0:
         for artist in existing["data"]:
             await server.lidarr_delete_artist(
