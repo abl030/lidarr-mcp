@@ -11,6 +11,9 @@ for i in $(seq 1 "$MAX_WAIT"); do
     if [ "$status" = "healthy" ]; then
         echo "Lidarr is healthy after ${i}s"
 
+        # Ensure volume directories are writable by the Lidarr user
+        docker exec "$CONTAINER" chmod 777 /music /downloads 2>/dev/null || true
+
         # Extract API key from config.xml
         API_KEY=$(docker exec "$CONTAINER" cat /config/config.xml | grep -oP '(?<=<ApiKey>)[^<]+')
         echo "API Key: $API_KEY"

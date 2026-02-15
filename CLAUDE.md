@@ -12,6 +12,7 @@ Auto-generated MCP server for the Lidarr API v1. Tools generated from `spec/open
 6. **Add tests with features**. When adding new functionality, always write automated tests in the same change.
 7. **Sprint progress lives in CLAUDE.md**. When work spans multiple sessions, document sprint plans, progress, and outcomes here.
 8. **Reference `research/mcp-server-best-practices.md`** before making generator decisions. These are hard-won lessons from 3 prior MCP builds (pfSense 677 tools, UniFi 286 tools, Loki 42 tools).
+9. **Every new feature must include both tests AND docstring updates.** Tool docstrings are the primary way consuming LLMs discover and understand tools. If a feature isn't described in docstrings, it doesn't exist to the LLM. When adding or changing functionality: (a) add/update unit tests, (b) add/update integration tests where the feature touches the generated server, and (c) ensure tool docstrings clearly describe what the tool does, its parameters, expected return values, and any workflow hints (e.g. "call X after Y"). Docstrings are generated from `context_builder.py` descriptions and `_WORKFLOW_HINTS` — update those, not the generated file.
 
 ## Repository Structure
 
@@ -147,10 +148,59 @@ Deliverables:
 - Total tests: 87 (58 Sprint 1 + 29 Sprint 2).
 
 ### Sprint 3: Nix Packaging & Integration
-Status: NOT STARTED
+Status: COMPLETE
+
+Goal: Close the gap between generator tests and live-server validation. Add integration tests against Docker Lidarr, a Makefile for orchestration, and Nix flake checks.
+
+#### 3a — pytest config (`pyproject.toml`)
+Added `[tool.pytest.ini_options]`: `asyncio_mode = "auto"`, integration marker, `timeout = 60`.
+
+#### 3b — Test infrastructure (`tests/conftest.py`, `generated/__init__.py`)
+- `generated/__init__.py`: Empty package marker for importability.
+- `tests/conftest.py`: Session-scoped `server` fixture (sets env vars, imports `generated.server`), `pytest_collection_modifyitems` hook auto-skips integration tests when `LIDARR_API_KEY` is unset.
+
+#### 3c — Integration tests (`tests/test_integration.py`)
+20 async tests across 9 categories, all `@pytest.mark.integration`:
+
+| Category | Tests | What's validated |
+|----------|-------|-----------------|
+| Connection & Auth | 2 | System status returns version; bad API key → structured error dict |
+| High-level tools | 4 | `get_overview` keys, `search_tools` matching/no-match, `report_issue` gh command |
+| Read operations | 4 | `list_artists`, `list_albums`, `list_root_folders`, `list_quality_profiles` |
+| List enhancements | 2 | `fields` restricts keys, `query` filters rows |
+| CRUD lifecycle | 1 | lookup Metallica → create → get → update → verify → delete → verify 404 |
+| Command tools | 1 | `command_missing_album_search` executes |
+| Confirmation gates | 2 | `create_artist(confirm=False)` → preview, `delete_artist(confirm=False)` → preview |
+| Error handling | 2 | Non-existent artist → 404, non-existent album → error |
+| Unicode | 2 | Lookup with en-dash doesn't crash; `_normalize_unicode` helper works |
+
+#### 3d — Makefile
+- `make test` → unit tests only (fast, no Docker)
+- `make test-integration` → docker up → wait → extract key → pytest integration → docker down
+- `make generate` → regenerate server.py
+- `make check` → nix flake check
+
+#### 3e — Nix flake improvements (`flake.nix`)
+Added `checks.${system}.unit-tests` output that runs unit tests (not integration) inside a Nix derivation via `pkgs.runCommand`.
+
+#### Bugs found and fixed during integration testing
+- `mcp._tool_manager.tools` → `._tools` (FastMCP internal API mismatch in `lidarr_search_tools`)
+- `LidarrClient.request()` crashed on empty response body (DELETE returns 200 with no JSON) — added `not response.content` guard
+- `docker/wait-for-ready.sh` now `chmod 777` volume mounts so Lidarr user can write
+
+Deliverables:
+- `pyproject.toml`: `[tool.pytest.ini_options]` with asyncio_mode, session-scoped event loop, markers, timeout.
+- `generated/__init__.py`: Empty package marker.
+- `tests/conftest.py`: Session fixture with `_ToolUnwrapper` proxy (unwraps FastMCP `FunctionTool` → raw `async def`) + auto-skip hook.
+- `tests/test_integration.py`: 20 integration tests across 9 categories.
+- `Makefile`: 4 targets (test, test-integration, generate, check).
+- `flake.nix`: `checks` output with unit-tests derivation, `gnumake` in devShell.
+- `templates/server.py.j2`: Fixed `_tool_manager._tools` access, empty response body handling.
+- `docker/wait-for-ready.sh`: Volume permission fix.
+- Total tests: 107 (87 unit + 20 integration).
 
 ### Sprint 4: LLM Testing
-Status: NOT STARTED
+Status: SKIPPED — deferred indefinitely (cost-prohibitive for now).
 
 ### Sprint 5: Documentation & Release
-Status: NOT STARTED
+Status: COMPLETE — shipped as v0.1.0.

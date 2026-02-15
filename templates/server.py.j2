@@ -78,7 +78,7 @@ class LidarrClient:
             json=json_body,
         )
         response.raise_for_status()
-        if response.status_code == 204:
+        if response.status_code == 204 or not response.content:
             return {"status": "success", "message": "No content"}
         return response.json()
 
@@ -178,7 +178,7 @@ async def lidarr_search_tools(keyword: str) -> dict[str, Any]:
     """
     keyword_lower = keyword.lower()
     matches = []
-    for tool in mcp._tool_manager.tools.values():
+    for tool in mcp._tool_manager._tools.values():
         if keyword_lower in tool.name.lower() or keyword_lower in (tool.description or "").lower():
             matches.append({"name": tool.name, "description": (tool.description or "")[:120]})
     return {"summary": f"Found {len(matches)} tools matching '{keyword}'", "matches": matches}

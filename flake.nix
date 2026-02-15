@@ -30,6 +30,27 @@
       };
     });
 
+    checks = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+      pythonEnv = pkgs.python3.withPackages (ps: [
+        ps.fastmcp
+        ps.httpx
+        ps.jinja2
+        ps.pytest
+        ps.pytest-asyncio
+        ps.pytest-timeout
+      ]);
+    in {
+      unit-tests = pkgs.runCommand "lidarr-mcp-unit-tests" {
+        nativeBuildInputs = [pythonEnv];
+      } ''
+        cp -r ${./.} src
+        cd src
+        python -m pytest tests/ -m "not integration" -q
+        touch $out
+      '';
+    });
+
     devShells = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system};
       pythonEnv = pkgs.python3.withPackages (ps: [
@@ -42,7 +63,7 @@
       ]);
     in {
       default = pkgs.mkShell {
-        packages = [pythonEnv];
+        packages = [pythonEnv pkgs.gnumake];
       };
     });
   };
