@@ -147,6 +147,22 @@ def _camel_to_snake(name: str) -> str:
     return re.sub(r"([a-z\d])([A-Z])", r"\1_\2", s1).lower()
 
 
+def _sanitize_segment(segment: str) -> str:
+    """Sanitize a path segment for use in a Python identifier.
+
+    Converts camelCase, replaces dots/hyphens with underscores,
+    removes other invalid characters.
+    """
+    name = _camel_to_snake(segment)
+    # Replace dots and hyphens with underscores
+    name = re.sub(r"[.\-]", "_", name)
+    # Remove any remaining non-alphanumeric characters (except underscore)
+    name = re.sub(r"[^a-z0-9_]", "", name)
+    # Collapse multiple underscores
+    name = re.sub(r"_+", "_", name)
+    return name.strip("_")
+
+
 def _extract_path_parts(path: str) -> list[str]:
     """Extract meaningful path segments, stripping /api/v1/ prefix and {params}."""
     # Strip common prefixes
@@ -179,6 +195,11 @@ def build_tool_name(method: str, path: str, operation_id: str | None = None) -> 
 
     # Check for sub-action verbs (lookup, monitor, editor)
     if sub_parts and sub_parts[0] in _SUB_ACTION_VERBS:
+        # For non-GET/PUT methods on sub-action paths, use the HTTP verb instead
+        if method_lower in ("delete", "patch"):
+            verb = _METHOD_VERBS[method_lower]
+            resource_name = _pluralize(resource)
+            return f"lidarr_{verb}_{resource_name}_batch"
         verb = _SUB_ACTION_VERBS[sub_parts[0]]
         # "edit" works on collections, "lookup" on singular concept
         if verb == "edit":
@@ -190,7 +211,7 @@ def build_tool_name(method: str, path: str, operation_id: str | None = None) -> 
     # Sub-resource paths like /wanted/missing, /config/host, /system/status
     if sub_parts:
         # Filter out path params
-        clean_subs = [_camel_to_snake(p) for p in sub_parts if not p.startswith("{")]
+        clean_subs = [_sanitize_segment(p) for p in sub_parts if not p.startswith("{")]
         if clean_subs:
             sub_resource = "_".join(clean_subs)
             if method_lower == "get" and not has_id:

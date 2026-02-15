@@ -23,6 +23,8 @@ LIDARR_URL = os.environ.get("LIDARR_URL", "http://localhost:8686")
 LIDARR_API_KEY = os.environ.get("LIDARR_API_KEY", "")
 LIDARR_MODULES = os.environ.get("LIDARR_MODULES", "")
 LIDARR_READ_ONLY = os.environ.get("LIDARR_READ_ONLY", "false").lower() == "true"
+LIDARR_DEFAULT_QUALITY_PROFILE_ID = os.environ.get("LIDARR_DEFAULT_QUALITY_PROFILE_ID", "")
+LIDARR_DEFAULT_ROOT_FOLDER = os.environ.get("LIDARR_DEFAULT_ROOT_FOLDER", "")
 
 # Parse enabled modules
 _enabled_modules: set[str] | None = None
@@ -82,6 +84,36 @@ class LidarrClient:
 
 
 _client = LidarrClient()
+
+# ---------------------------------------------------------------------------
+# Unicode normalization (Lidarr-specific)
+# ---------------------------------------------------------------------------
+
+# MusicBrainz uses exotic Unicode hyphens/spaces that Lidarr doesn't handle
+_UNICODE_REPLACEMENTS: dict[str, str] = {
+    "\u2010": "-",   # HYPHEN
+    "\u2011": "-",   # NON-BREAKING HYPHEN
+    "\u2012": "-",   # FIGURE DASH
+    "\u2013": "-",   # EN DASH
+    "\u2014": "-",   # EM DASH
+    "\u2015": "-",   # HORIZONTAL BAR
+    "\u2212": "-",   # MINUS SIGN
+    "\u00a0": " ",   # NON-BREAKING SPACE
+    "\u2002": " ",   # EN SPACE
+    "\u2003": " ",   # EM SPACE
+    "\u2009": " ",   # THIN SPACE
+    "\u200a": " ",   # HAIR SPACE
+    "\u200b": "",    # ZERO WIDTH SPACE
+    "\ufeff": "",    # BOM / ZERO WIDTH NO-BREAK SPACE
+}
+
+_UNICODE_TABLE = str.maketrans(_UNICODE_REPLACEMENTS)
+
+
+def _normalize_unicode(text: str) -> str:
+    """Normalize exotic Unicode characters to ASCII equivalents."""
+    return text.translate(_UNICODE_TABLE)
+
 
 # ---------------------------------------------------------------------------
 # Response helpers
@@ -187,13 +219,189 @@ async def lidarr_report_issue(
 # ---------------------------------------------------------------------------
 
 {% for tool in tools %}
+{% set indent = "" %}
 {% if tool.module %}
 if _module_enabled("{{ tool.module }}"):
+{% set indent = "    " %}
 {% endif %}
 {% if tool.is_mutation %}
-    if not LIDARR_READ_ONLY:
+{{ indent }}if not LIDARR_READ_ONLY:
+{% set indent = indent + "    " %}
 {% endif %}
-    # TODO: Generated tool {{ tool.name }} for {{ tool.method }} {{ tool.path }}
-    pass
+
+{{ indent }}@mcp.tool()
+{% set required_params = tool.params | selectattr("required") | list %}
+{% set optional_params = tool.params | rejectattr("required") | list %}
+{% if tool.is_mutation %}
+{{ indent }}async def {{ tool.name }}(
+{% for p in required_params %}
+{{ indent }}    {{ p.name }}: {{ p.type }},
+{% endfor %}
+{% if tool.is_list %}
+{{ indent }}    fields: str = "",
+{{ indent }}    query: dict[str, Any] | None = None,
+{% endif %}
+{% for p in optional_params %}
+{% if p.env_default is defined and p.env_default %}
+{{ indent }}    {{ p.name }}: {{ p.type }} | None = None,
+{% elif p.default is none %}
+{{ indent }}    {{ p.name }}: {{ p.type }} | None = None,
+{% elif p.default is sameas true %}
+{{ indent }}    {{ p.name }}: {{ p.type }} = True,
+{% elif p.default is sameas false %}
+{{ indent }}    {{ p.name }}: {{ p.type }} = False,
+{% elif p.default is string %}
+{{ indent }}    {{ p.name }}: {{ p.type }} = "{{ p.default }}",
+{% else %}
+{{ indent }}    {{ p.name }}: {{ p.type }} = {{ p.default }},
+{% endif %}
+{% endfor %}
+{{ indent }}    confirm: bool = False,
+{{ indent }}) -> dict[str, Any] | list[Any] | str:
+{{ indent }}    """{{ tool.description }}
+
+{{ indent }}    Requires confirm=True to execute. Set confirm=False to preview.
+{% for p in tool.params %}
+{% if p.description %}
+{{ indent }}    {{ p.name }}: {{ p.description }}
+{% endif %}
+{% endfor %}
+{{ indent }}    """
+{{ indent }}    if not confirm:
+{{ indent }}        return {"preview": "{{ tool.method | upper }} {{ tool.path }}", "confirm": "Set confirm=True to execute this {{ tool.method | upper }} request."}
+{% else %}
+{{ indent }}async def {{ tool.name }}(
+{% for p in required_params %}
+{{ indent }}    {{ p.name }}: {{ p.type }},
+{% endfor %}
+{% if tool.is_list %}
+{{ indent }}    fields: str = "",
+{{ indent }}    query: dict[str, Any] | None = None,
+{% endif %}
+{% for p in optional_params %}
+{% if p.env_default is defined and p.env_default %}
+{{ indent }}    {{ p.name }}: {{ p.type }} | None = None,
+{% elif p.default is none %}
+{{ indent }}    {{ p.name }}: {{ p.type }} | None = None,
+{% elif p.default is sameas true %}
+{{ indent }}    {{ p.name }}: {{ p.type }} = True,
+{% elif p.default is sameas false %}
+{{ indent }}    {{ p.name }}: {{ p.type }} = False,
+{% elif p.default is string %}
+{{ indent }}    {{ p.name }}: {{ p.type }} = "{{ p.default }}",
+{% else %}
+{{ indent }}    {{ p.name }}: {{ p.type }} = {{ p.default }},
+{% endif %}
+{% endfor %}
+{{ indent }}) -> dict[str, Any] | list[Any] | str:
+{{ indent }}    """{{ tool.description }}
+
+{% for p in tool.params %}
+{% if p.description %}
+{{ indent }}    {{ p.name }}: {{ p.description }}
+{% endif %}
+{% endfor %}
+{{ indent }}    """
+{% endif %}
+{% set path_params = tool.params | selectattr("location", "equalto", "path") | list %}
+{% set query_params = tool.params | selectattr("location", "equalto", "query") | list %}
+{% set body_params = tool.params | selectattr("location", "equalto", "body") | list %}
+{% set api_path = tool.path %}
+{% if path_params %}
+{{ indent }}    _path = f"{{ tool.path }}"
+{% else %}
+{{ indent }}    _path = "{{ tool.path }}"
+{% endif %}
+{% if tool.is_lookup %}
+{% for p in query_params %}
+{% if p.name == "term" %}
+{{ indent }}    if {{ p.name }} is not None:
+{{ indent }}        {{ p.name }} = _normalize_unicode({{ p.name }})
+{% endif %}
+{% endfor %}
+{% endif %}
+{% for p in tool.params %}
+{% if p.env_default is defined and p.env_default %}
+{% if p.type == "int" or p.type == "int | None" %}
+{{ indent }}    if {{ p.name }} is None and {{ p.env_default }}:
+{{ indent }}        {{ p.name }} = int({{ p.env_default }})
+{% else %}
+{{ indent }}    if {{ p.name }} is None and {{ p.env_default }}:
+{{ indent }}        {{ p.name }} = {{ p.env_default }}
+{% endif %}
+{% endif %}
+{% endfor %}
+{% if query_params %}
+{{ indent }}    _params: dict[str, Any] = {}
+{% for p in query_params %}
+{% if not p.required %}
+{{ indent }}    if {{ p.name }} is not None:
+{{ indent }}        _params["{{ p.name }}"] = {{ p.name }}
+{% else %}
+{{ indent }}    _params["{{ p.name }}"] = {{ p.name }}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if tool.is_command is defined and tool.is_command %}
+{{ indent }}    _body: dict[str, Any] = {"name": "{{ tool.command_name }}"}
+{% for p in body_params %}
+{% if not p.required %}
+{{ indent }}    if {{ p.name }} is not None:
+{{ indent }}        _body["{{ p.name }}"] = {{ p.name }}
+{% else %}
+{{ indent }}    _body["{{ p.name }}"] = {{ p.name }}
+{% endif %}
+{% endfor %}
+{% elif body_params %}
+{{ indent }}    _body: dict[str, Any] = {}
+{% for p in body_params %}
+{% if not p.required %}
+{{ indent }}    if {{ p.name }} is not None:
+{{ indent }}        _body["{{ p.name }}"] = {{ p.name }}
+{% else %}
+{{ indent }}    _body["{{ p.name }}"] = {{ p.name }}
+{% endif %}
+{% endfor %}
+{% endif %}
+{{ indent }}    try:
+{{ indent }}        _resp = await _client.request(
+{{ indent }}            "{{ tool.method | upper }}",
+{{ indent }}            _path,
+{% if query_params %}
+{{ indent }}            params=_params,
+{% endif %}
+{% if body_params or (tool.is_command is defined and tool.is_command) %}
+{{ indent }}            json_body=_body,
+{% endif %}
+{{ indent }}        )
+{{ indent }}    except httpx.HTTPStatusError as exc:
+{{ indent }}        return {
+{{ indent }}            "error": True,
+{{ indent }}            "source": "lidarr_api",
+{{ indent }}            "status": exc.response.status_code,
+{{ indent }}            "message": exc.response.text[:500],
+{{ indent }}            "tool": "{{ tool.name }}",
+{{ indent }}        }
+{{ indent }}    except httpx.RequestError as exc:
+{{ indent }}        return {
+{{ indent }}            "error": True,
+{{ indent }}            "source": "network",
+{{ indent }}            "status": 0,
+{{ indent }}            "message": str(exc)[:500],
+{{ indent }}            "tool": "{{ tool.name }}",
+{{ indent }}        }
+{% if tool.is_list and tool.response_type == "array" %}
+{{ indent }}    if isinstance(_resp, list):
+{{ indent }}        return _filter_response(_resp, fields=fields, query=query)
+{% elif tool.is_list and tool.response_type == "paging" %}
+{{ indent }}    if isinstance(_resp, dict) and "records" in _resp:
+{{ indent }}        records = _resp["records"]
+{{ indent }}        filtered = _filter_response(records, fields=fields, query=query)
+{{ indent }}        filtered["totalRecords"] = _resp.get("totalRecords", 0)
+{{ indent }}        filtered["page"] = _resp.get("page", 1)
+{{ indent }}        filtered["pageSize"] = _resp.get("pageSize", 10)
+{{ indent }}        return filtered
+{% endif %}
+{{ indent }}    return _resp
 
 {% endfor %}

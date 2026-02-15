@@ -74,10 +74,77 @@ nix develop -c python -m generator    # regenerate generated/server.py
 ## Sprint Progress
 
 ### Sprint 1: Generator Core
-Status: NOT STARTED
+Status: COMPLETE
+
+Deliverables:
+- `naming.py`: Path-based tool naming (no operationIds in spec). Handles CRUD, sub-actions (lookup/monitor/editor), sub-resources, deduplication. 230 unique valid Python identifiers.
+- `schema_parser.py`: Full parameter extraction — path/query/body params, `$ref` resolution, `allOf` composition, `readOnly` exclusion, enum value extraction, large integer sanitization, PATCH/PUT `None` defaults, body-vs-path deduplication.
+- `context_builder.py`: Iterates all paths/methods, builds tool dicts, assigns modules, flags mutations/lists, generates descriptions.
+- `templates/server.py.j2`: Generates real async functions with signatures, docstrings, confirmation gates, list enhancements (fields/query), module gating, read-only gating.
+- `generated/server.py`: 230 tools, 8005 lines, valid Python, 16 modules.
+- 58 tests (naming, modules, schema parsing, full pipeline).
 
 ### Sprint 2: Quality & Correctness
-Status: NOT STARTED
+Status: COMPLETE
+
+Goal: Close all remaining best-practice gaps from `research/mcp-server-best-practices.md` and add Lidarr-specific enhancements.
+
+#### 2a — Apply-pattern reminders in docstrings (BP #5)
+Add workflow hints to mutation tool docstrings so the LLM consumer knows what to call next:
+- `lidarr_create_artist` → *"Note: Call lidarr_search_tools with 'command' to find album search commands after adding."*
+- `lidarr_monitor_album` → *"Note: Call lidarr_create_command with name='AlbumSearch' to trigger a download search."*
+- `lidarr_update_artist` / `lidarr_update_album` → *"Note: Call lidarr_create_command with name='RefreshArtist' after updating."*
+- `lidarr_delete_artist` → *"Note: Files may remain on disk unless deleteFiles=True."*
+Implement via a `_WORKFLOW_HINTS` dict in `context_builder.py` keyed by tool name, appended to descriptions.
+
+#### 2b — Error source distinction (BP #8)
+Wrap `_client.request()` in a try/except that catches `httpx.HTTPStatusError` and returns a structured error dict:
+```python
+{"error": True, "source": "lidarr_api", "status": 404, "message": "Not Found", "tool": "lidarr_get_artist"}
+```
+This makes it unambiguous whether the error came from the Lidarr API vs. schema validation vs. network failure. Implement in the template (`server.py.j2`) around the `_client.request()` call.
+
+#### 2c — Array sub-resource documentation (BP #14)
+For body params with `list[dict]` type, append a note to the description:
+*"Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead."*
+Implement in `schema_parser.py` when building body param descriptions.
+
+#### 2d — Sub-resource parent_id typing (BP #20)
+Normalize path params ending in `Id` (e.g. `artistId`, `albumId`) to `str | int` instead of using the raw spec type. Implement in `schema_parser.py` for `location == "path"` params.
+
+#### 2e — Unicode normalization (Lidarr-specific)
+Add a `_normalize_unicode(text: str) -> str` helper to the template that normalizes exotic Unicode characters (U+2010–U+2015 hyphens, U+00A0 non-breaking space, etc.) to ASCII equivalents. Apply it in `lidarr_lookup_artist` and `lidarr_lookup_album` to the `term` parameter before sending to the API.
+Implement as a helper function in the template and a Jinja2 conditional in the tool body for lookup tools.
+
+#### 2f — Command endpoint polymorphism (Lidarr-specific)
+Instead of one generic `lidarr_create_command`, generate dedicated tools per command type:
+- `lidarr_command_album_search(albumIds: list[int])`
+- `lidarr_command_artist_search(artistId: int)`
+- `lidarr_command_refresh_artist(artistId: int)`
+- `lidarr_command_rescan_artist(artistId: int)`
+- `lidarr_command_missing_album_search()`
+- `lidarr_command_manual_import(...)`
+Add a `_COMMAND_TYPES` dict in `context_builder.py` that expands `POST /api/v1/command` into multiple tools with appropriate params and descriptions. Keep the generic `lidarr_create_command` as a fallback for unlisted command types.
+
+#### 2g — Quality profile workflow hints (Lidarr-specific)
+Add env-var defaults `LIDARR_DEFAULT_QUALITY_PROFILE_ID` and `LIDARR_DEFAULT_ROOT_FOLDER` to the template config section. Wire them as defaults in `lidarr_create_artist` params `qualityProfileId` and `rootFolderPath` so the consumer doesn't need to look them up every time.
+
+#### 2h — Tests
+- Test workflow hints appear in generated docstrings
+- Test error wrapping returns structured dicts
+- Test array sub-resource notes in descriptions
+- Test parent_id params have `str | int` type
+- Test unicode normalization helper
+- Test command polymorphism produces separate tools
+- Test quality profile env-var defaults
+
+Deliverables:
+- `context_builder.py`: `_WORKFLOW_HINTS` dict (2a), `_COMMAND_TYPES` list with 5 dedicated command tools (2f), `_ENV_DEFAULTS` for quality profile env vars (2g), `is_lookup` flag for unicode normalization (2e).
+- `schema_parser.py`: Array sub-resource notes for `list[dict]` params (2c), parent_id `str | int` normalization for path params ending in `Id` (2d).
+- `templates/server.py.j2`: Error wrapping with `httpx.HTTPStatusError`/`httpx.RequestError` → structured error dicts (2b), `_normalize_unicode` helper + application in lookup tools (2e), `LIDARR_DEFAULT_QUALITY_PROFILE_ID`/`LIDARR_DEFAULT_ROOT_FOLDER` env vars (2g), command body with `{"name": "CommandName"}` (2f).
+- `generated/server.py`: 235 tools (230 API + 5 command types), valid Python.
+- `tests/test_sprint2.py`: 29 tests covering all 7 features.
+- Total tests: 87 (58 Sprint 1 + 29 Sprint 2).
 
 ### Sprint 3: Nix Packaging & Integration
 Status: NOT STARTED
