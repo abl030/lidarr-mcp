@@ -1,0 +1,34 @@
+# Lidarr test instance for integration testing.
+# Usage:
+#   docker compose -f docker/docker-compose.yml up -d
+#   bash docker/wait-for-ready.sh
+#   pytest tests/test_integration.py -v --integration
+#   docker compose -f docker/docker-compose.yml down
+
+version: "3.8"
+
+services:
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: lidarr-test
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+    ports:
+      - "8686:8686"
+    volumes:
+      - lidarr-config:/config
+      - lidarr-music:/music
+      - lidarr-downloads:/downloads
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8686/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  lidarr-config:
+  lidarr-music:
+  lidarr-downloads:
