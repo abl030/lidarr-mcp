@@ -263,3 +263,44 @@ Deliverables:
 - `tests/test_integration.py`: 1 new integration test (merge partial update).
 - `generated/server.py`: Regenerated with all changes (235 tools, 28 PUT tools with merge).
 - Total tests: 132 (111 unit + 21 integration).
+
+### Issue #3: UX improvements — response size, monitor bug, grab_album tool
+Status: COMPLETE
+
+Goal: Fix real-world friction points: mutation response bloat, monitor bug workaround, multi-step album grab workflow, and upstream search bypass.
+
+#### 3a — Compact mutation responses
+Added `_compact_mutation_response` helper in `templates/server.py.j2`. All mutation tool returns now use this instead of raw `_resp`:
+- List responses (e.g. `monitor_album` updating 29 albums) → `{"ok": true, "count": 29, "ids": [...]}`
+- Dict responses (e.g. `create_artist`) → top-level keys preserved, nested objects compacted via `_compact_object`
+- Non-mutation (GET) tools unaffected
+
+Mutation tool docstrings updated to document compact response format.
+
+#### 3b — Monitor bug workaround
+`addOptions.monitor: "none"` on `create_artist` may still mark albums as monitored (Lidarr API bug). Updated `_WORKFLOW_HINTS["lidarr_create_artist"]` to warn about this behavior and document the workaround: create artist → batch-unmonitor → selectively monitor. The `lidarr_grab_album` tool handles this automatically.
+
+#### 3c — `lidarr_grab_album` high-level tool
+Added always-registered `lidarr_grab_album` tool that combines 5 tool calls into one:
+1. Lookup artist (or use `foreignArtistId` to bypass search)
+2. Create artist if not in library (with `addOptions.monitor="none"`)
+3. List albums and match by case-insensitive substring
+4. Monitor the target album
+5. Trigger download search
+
+Returns `{"ok": true, "artistId": ..., "albumId": ..., "albumTitle": ..., "status": "search_triggered"}` on success. On album mismatch, returns available titles for retry.
+
+#### 3d — MBID fallback (upstream search bypass)
+`lidarr_grab_album` accepts `foreignArtistId` parameter (MusicBrainz ID) to bypass Lidarr's search API when it's unavailable. Updated `lidarr_create_artist` workflow hint to document `foreignArtistId` for direct creation.
+
+#### 3e — Tests
+- `tests/test_issue3.py`: 11 new unit tests covering compaction, generated code assertions, grab_album presence/params/docstring, workflow hints.
+- `tests/test_integration.py`: 2 new integration tests (`test_grab_album_confirm_false_preview`, `test_grab_album_workflow`).
+
+Deliverables:
+- `templates/server.py.j2`: `_compact_mutation_response` helper, mutation return compaction, `lidarr_grab_album` tool, mutation docstring update.
+- `generator/context_builder.py`: Updated `_WORKFLOW_HINTS["lidarr_create_artist"]` with monitor bug warning, MBID note, and `lidarr_grab_album` reference.
+- `tests/test_issue3.py`: 11 new unit tests.
+- `tests/test_integration.py`: 2 new integration tests.
+- `generated/server.py`: Regenerated with all changes (235 tools + grab_album).
+- Total tests: 145 (122 unit + 23 integration).

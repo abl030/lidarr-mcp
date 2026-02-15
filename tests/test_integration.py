@@ -282,11 +282,14 @@ async def test_update_artist_merge_partial(server: ModuleType) -> None:
 
     merge=True auto-fetches the existing object, merges the caller's changes,
     and PUTs the complete result, so callers don't need to pass all fields.
+
+    Uses Radiohead (not Metallica) to avoid Lidarr race condition on delete
+    when running after test_crud_artist_lifecycle.
     """
     quality_profile_id, root_folder = await _get_setup_ids(server)
 
-    # Lookup and create an artist
-    lookup = await server.lidarr_lookup_artist(term="Metallica")
+    # Lookup and create an artist (Radiohead to avoid collision with CRUD test)
+    lookup = await server.lidarr_lookup_artist(term="Radiohead")
     assert isinstance(lookup, dict) and lookup["count"] > 0
     artist_data = lookup["data"][0]
     foreign_id = artist_data["foreignArtistId"]
@@ -300,7 +303,7 @@ async def test_update_artist_merge_partial(server: ModuleType) -> None:
             )
 
     created: dict[str, Any] = await server.lidarr_create_artist(
-        artistName="Metallica",
+        artistName="Radiohead",
         foreignArtistId=foreign_id,
         qualityProfileId=quality_profile_id,
         metadataProfileId=1,
@@ -328,7 +331,7 @@ async def test_update_artist_merge_partial(server: ModuleType) -> None:
         assert isinstance(refetched, dict)
         assert refetched["monitored"] is True
         # Verify merge didn't lose artist name
-        assert refetched["artistName"] == "Metallica"
+        assert refetched["artistName"] == "Radiohead"
     finally:
         await server.lidarr_delete_artist(
             id=artist_id, deleteFiles=True, confirm=True,
@@ -402,6 +405,61 @@ async def test_lookup_with_en_dash_does_not_crash(server: ModuleType) -> None:
     # Should succeed (either results or empty list, but not an error/crash)
     assert isinstance(result, dict)
     assert "count" in result or "error" in result
+
+
+# ── grab_album ────────────────────────────────────────────────────────────
+
+
+async def test_grab_album_confirm_false_preview(server: ModuleType) -> None:
+    """lidarr_grab_album with confirm=False returns a preview."""
+    result = await server.lidarr_grab_album(
+        artist="Metallica", album="Master of Puppets", confirm=False,
+    )
+    assert isinstance(result, dict)
+    assert "preview" in result
+    assert result["artist"] == "Metallica"
+    assert result["album"] == "Master of Puppets"
+
+
+async def test_grab_album_workflow(server: ModuleType) -> None:
+    """Full grab_album workflow: create → grab → verify → cleanup."""
+    quality_profile_id, root_folder = await _get_setup_ids(server)
+
+    # Lookup to get foreignArtistId for cleanup
+    lookup = await server.lidarr_lookup_artist(term="Metallica")
+    assert isinstance(lookup, dict) and lookup["count"] > 0
+    foreign_id = lookup["data"][0]["foreignArtistId"]
+
+    # Clean up any leftover from previous runs
+    existing = await server.lidarr_list_artists(filter=f"foreignArtistId={foreign_id}")
+    if isinstance(existing, dict) and existing.get("count", 0) > 0:
+        for artist in existing["data"]:
+            await server.lidarr_delete_artist(
+                id=artist["id"], deleteFiles=True, confirm=True,
+            )
+
+    try:
+        # Grab an album (this should create the artist and trigger search)
+        result = await server.lidarr_grab_album(
+            artist="Metallica",
+            album="Master of Puppets",
+            qualityProfileId=quality_profile_id,
+            rootFolderPath=root_folder,
+            confirm=True,
+        )
+        assert isinstance(result, dict)
+        assert result.get("ok") is True, f"grab_album failed: {result}"
+        assert "artistId" in result
+        assert "albumId" in result
+        assert result["status"] == "search_triggered"
+    finally:
+        # Cleanup: find and delete the artist
+        existing = await server.lidarr_list_artists(filter=f"foreignArtistId={foreign_id}")
+        if isinstance(existing, dict) and existing.get("count", 0) > 0:
+            for artist in existing["data"]:
+                await server.lidarr_delete_artist(
+                    id=artist["id"], deleteFiles=True, confirm=True,
+                )
 
 
 async def test_normalize_unicode_helper(server: ModuleType) -> None:

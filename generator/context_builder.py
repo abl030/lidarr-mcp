@@ -75,6 +75,11 @@ _WORKFLOW_HINTS: dict[str, str] = {
         " commands after adding. Set addOptions.monitor to control which albums"
         " are monitored: 'all', 'future', 'missing', 'existing', 'latest',"
         " 'first', or 'none'. Default monitors entire discography."
+        " Warning: addOptions.monitor='none' may still mark albums as monitored"
+        " (Lidarr API bug). Workaround: create artist, then batch-unmonitor"
+        " albums, then selectively monitor. Or use lidarr_grab_album which"
+        " handles this automatically. foreignArtistId accepts MusicBrainz"
+        " artist IDs for direct creation when Lidarr search API is unavailable."
     ),
     "lidarr_monitor_album": (
         "Note: Call lidarr_create_command with name='AlbumSearch' to trigger"

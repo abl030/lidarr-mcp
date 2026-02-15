@@ -136,6 +136,16 @@ def _compact_object(row: dict[str, Any]) -> dict[str, Any]:
     return {k: _compact_value(v) for k, v in row.items()}
 
 
+def _compact_mutation_response(resp: Any) -> dict[str, Any] | list[Any]:
+    """Compact a mutation response to save context window."""
+    if isinstance(resp, list):
+        ids = [item.get("id") for item in resp if isinstance(item, dict)]
+        return {"ok": True, "count": len(resp), "ids": ids}
+    if isinstance(resp, dict):
+        return _compact_object(resp)
+    return resp
+
+
 def _filter_response(
     data: list[dict[str, Any]],
     fields: str = "",
@@ -239,6 +249,184 @@ async def lidarr_report_issue(
 
 
 # ---------------------------------------------------------------------------
+# High-level workflow tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def lidarr_grab_album(
+    artist: str = "",
+    album: str = "",
+    foreignArtistId: str = "",
+    qualityProfileId: int | None = None,
+    metadataProfileId: int | None = None,
+    rootFolderPath: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Grab a specific album: look up artist, add to library if missing, monitor the album, and trigger download search.
+
+    Requires confirm=True to execute. Set confirm=False to preview.
+    artist: Artist name to search for (e.g. "DJ Harrison"). Required unless foreignArtistId is provided.
+    album: Album title to match (case-insensitive substring match, e.g. "ElectroSoul").
+    foreignArtistId: MusicBrainz artist ID. Use this to bypass Lidarr's search API when it's unavailable.
+    qualityProfileId: Quality profile ID. Defaults to LIDARR_DEFAULT_QUALITY_PROFILE_ID env var.
+    rootFolderPath: Root folder path. Defaults to LIDARR_DEFAULT_ROOT_FOLDER env var.
+    metadataProfileId: Metadata profile ID. Defaults to 1.
+    Returns {"ok": true, "artistId": ..., "albumId": ..., "albumTitle": ..., "status": "search_triggered"} on success.
+    If the album title doesn't match, returns available album titles so you can retry with the correct name.
+    If unexpected errors occur, call lidarr_report_issue.
+    """
+    if not confirm:
+        return {"preview": "grab_album workflow", "confirm": "Set confirm=True to execute.", "artist": artist, "album": album}
+
+    # Resolve defaults
+    if qualityProfileId is None and LIDARR_DEFAULT_QUALITY_PROFILE_ID:
+        qualityProfileId = int(LIDARR_DEFAULT_QUALITY_PROFILE_ID)
+    if rootFolderPath is None and LIDARR_DEFAULT_ROOT_FOLDER:
+        rootFolderPath = LIDARR_DEFAULT_ROOT_FOLDER
+    if metadataProfileId is None:
+        metadataProfileId = 1
+
+    # Step 1: Resolve artist
+    if not foreignArtistId and not artist:
+        return {"error": True, "step": "resolve_artist", "message": "Provide either 'artist' name or 'foreignArtistId'."}
+
+    artist_id: int | None = None
+    artist_name: str = artist
+
+    if foreignArtistId:
+        # Check if artist already in library by foreignArtistId
+        try:
+            existing = await _client.request("GET", "/api/v1/artist")
+            if isinstance(existing, list):
+                for a in existing:
+                    if isinstance(a, dict) and a.get("foreignArtistId") == foreignArtistId:
+                        artist_id = a["id"]
+                        artist_name = a.get("artistName", artist)
+                        break
+        except Exception as exc:
+            return {"error": True, "step": "check_existing", "message": str(exc)[:500]}
+
+        if artist_id is None:
+            # Create artist using MBID
+            try:
+                created = await _client.request("POST", "/api/v1/artist", json_body={
+                    "foreignArtistId": foreignArtistId,
+                    "artistName": artist_name or foreignArtistId,
+                    "qualityProfileId": qualityProfileId,
+                    "metadataProfileId": metadataProfileId,
+                    "rootFolderPath": rootFolderPath,
+                    "monitored": True,
+                    "addOptions": {"monitor": "none", "searchForMissingAlbums": False},
+                })
+                if isinstance(created, dict) and "id" in created:
+                    artist_id = created["id"]
+                    artist_name = created.get("artistName", artist_name)
+                else:
+                    return {"error": True, "step": "create_artist", "message": f"Unexpected response: {str(created)[:300]}"}
+            except httpx.HTTPStatusError as exc:
+                return {"error": True, "step": "create_artist", "status": exc.response.status_code, "message": exc.response.text[:500]}
+            except Exception as exc:
+                return {"error": True, "step": "create_artist", "message": str(exc)[:500]}
+    else:
+        # Lookup artist by name
+        try:
+            lookup = await _client.request("GET", "/api/v1/artist/lookup", params={"term": _normalize_unicode(artist)})
+        except Exception as exc:
+            return {"error": True, "step": "lookup_artist", "message": str(exc)[:500]}
+
+        if not isinstance(lookup, list) or len(lookup) == 0:
+            return {"error": True, "step": "lookup_artist", "message": f"No results for '{artist}'. Try foreignArtistId instead."}
+
+        best = lookup[0]
+        foreign_id = best.get("foreignArtistId", "")
+        artist_name = best.get("artistName", artist)
+
+        # Check if already in library
+        try:
+            existing = await _client.request("GET", "/api/v1/artist")
+            if isinstance(existing, list):
+                for a in existing:
+                    if isinstance(a, dict) and a.get("foreignArtistId") == foreign_id:
+                        artist_id = a["id"]
+                        break
+        except Exception:
+            pass
+
+        if artist_id is None:
+            # Create artist
+            try:
+                created = await _client.request("POST", "/api/v1/artist", json_body={
+                    "foreignArtistId": foreign_id,
+                    "artistName": artist_name,
+                    "qualityProfileId": qualityProfileId,
+                    "metadataProfileId": metadataProfileId,
+                    "rootFolderPath": rootFolderPath,
+                    "monitored": True,
+                    "addOptions": {"monitor": "none", "searchForMissingAlbums": False},
+                })
+                if isinstance(created, dict) and "id" in created:
+                    artist_id = created["id"]
+                else:
+                    return {"error": True, "step": "create_artist", "message": f"Unexpected response: {str(created)[:300]}"}
+            except httpx.HTTPStatusError as exc:
+                return {"error": True, "step": "create_artist", "status": exc.response.status_code, "message": exc.response.text[:500]}
+            except Exception as exc:
+                return {"error": True, "step": "create_artist", "message": str(exc)[:500]}
+
+    # Step 2: List albums for this artist (retry — metadata refresh may be in progress)
+    import asyncio as _asyncio
+    albums: list[Any] = []
+    for _attempt in range(6):
+        try:
+            resp = await _client.request("GET", "/api/v1/album", params={"artistId": artist_id})
+            if isinstance(resp, list) and len(resp) > 0:
+                albums = resp
+                break
+        except Exception:
+            pass
+        await _asyncio.sleep(2)
+
+    if not albums:
+        return {"error": True, "step": "list_albums", "artistId": artist_id, "message": "No albums found after waiting. Metadata may still be loading — try again shortly."}
+
+    # Step 3: Match album title
+    album_lower = album.lower()
+    match = None
+    for alb in albums:
+        if isinstance(alb, dict) and album_lower in alb.get("title", "").lower():
+            match = alb
+            break
+
+    if match is None:
+        available = [a.get("title", "?") for a in albums if isinstance(a, dict)]
+        return {"error": True, "step": "match_album", "message": f"No album matching '{album}'.", "available_albums": available}
+
+    album_id = match["id"]
+    album_title = match.get("title", album)
+
+    # Step 4: Monitor the target album
+    try:
+        await _client.request("PUT", "/api/v1/album/monitor", json_body={"albumIds": [album_id], "monitored": True})
+    except Exception as exc:
+        return {"error": True, "step": "monitor_album", "albumId": album_id, "message": str(exc)[:500]}
+
+    # Step 5: Trigger download search
+    try:
+        await _client.request("POST", "/api/v1/command", json_body={"name": "AlbumSearch", "albumIds": [album_id]})
+    except Exception as exc:
+        return {"error": True, "step": "album_search", "albumId": album_id, "message": str(exc)[:500]}
+
+    return {
+        "ok": True,
+        "artistId": artist_id,
+        "artistName": artist_name,
+        "albumId": album_id,
+        "albumTitle": album_title,
+        "status": "search_triggered",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Generated tools
 # ---------------------------------------------------------------------------
 
@@ -327,6 +515,7 @@ if _module_enabled("album"):
             """Create album If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             releases:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             media:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             images:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
@@ -404,7 +593,7 @@ if _module_enabled("album"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_album",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("album"):
 
@@ -463,6 +652,7 @@ if _module_enabled("album"):
             """Monitor album If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_create_command with name='AlbumSearch' to trigger a download search.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/album/monitor", "confirm": "Set confirm=True to execute this PUT request."}
@@ -495,7 +685,7 @@ if _module_enabled("album"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_monitor_album",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("album"):
 
@@ -566,6 +756,7 @@ if _module_enabled("album"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             releases:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             media:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             images:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
@@ -651,7 +842,7 @@ if _module_enabled("album"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_album",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("album"):
     if not LIDARR_READ_ONLY:
@@ -666,6 +857,7 @@ if _module_enabled("album"):
             """Delete album by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/album/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -697,7 +889,7 @@ if _module_enabled("album"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_album",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("album"):
     if not LIDARR_READ_ONLY:
@@ -712,6 +904,7 @@ if _module_enabled("album"):
             """Create album studio If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             artist:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             monitorNewItems: Values: all, none, new
             """
@@ -747,7 +940,7 @@ if _module_enabled("album"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_album_studio",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("artist"):
 
@@ -830,9 +1023,10 @@ if _module_enabled("artist"):
             statistics: dict | None = None,
             confirm: bool = False,
         ) -> dict[str, Any] | list[Any] | str:
-            """Create artist If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_search_tools with 'command' to find album search commands after adding. Set addOptions.monitor to control which albums are monitored: 'all', 'future', 'missing', 'existing', 'latest', 'first', or 'none'. Default monitors entire discography.
+            """Create artist If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_search_tools with 'command' to find album search commands after adding. Set addOptions.monitor to control which albums are monitored: 'all', 'future', 'missing', 'existing', 'latest', 'first', or 'none'. Default monitors entire discography. Warning: addOptions.monitor='none' may still mark albums as monitored (Lidarr API bug). Workaround: create artist, then batch-unmonitor albums, then selectively monitor. Or use lidarr_grab_album which handles this automatically. foreignArtistId accepts MusicBrainz artist IDs for direct creation when Lidarr search API is unavailable.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             status: Values: continuing, ended, deleted
             links:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             images:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
@@ -933,7 +1127,7 @@ if _module_enabled("artist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_artist",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("artist"):
     if not LIDARR_READ_ONLY:
@@ -956,6 +1150,7 @@ if _module_enabled("artist"):
             """Edit artists If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             monitorNewItems: Values: all, none, new
             applyTags: Values: add, remove, replace
             """
@@ -1008,7 +1203,7 @@ if _module_enabled("artist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_edit_artists",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("artist"):
     if not LIDARR_READ_ONLY:
@@ -1031,6 +1226,7 @@ if _module_enabled("artist"):
             """Delete artists batch If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             monitorNewItems: Values: all, none, new
             applyTags: Values: add, remove, replace
             """
@@ -1082,7 +1278,7 @@ if _module_enabled("artist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_artists_batch",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("artist"):
 
@@ -1207,6 +1403,7 @@ if _module_enabled("artist"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             status: Values: continuing, ended, deleted
             links:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             images:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
@@ -1313,7 +1510,7 @@ if _module_enabled("artist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_artist",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("artist"):
     if not LIDARR_READ_ONLY:
@@ -1328,6 +1525,7 @@ if _module_enabled("artist"):
             """Delete artist by ID If unexpected errors occur, call lidarr_report_issue. Note: Files may remain on disk unless deleteFiles=True.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/artist/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -1359,7 +1557,7 @@ if _module_enabled("artist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_artist",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -1413,6 +1611,7 @@ if _module_enabled("system"):
             """Create autotagging If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             specifications:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
             if not confirm:
@@ -1449,7 +1648,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_autotagging",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -1533,6 +1732,7 @@ if _module_enabled("system"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             specifications:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
             if not confirm:
@@ -1577,7 +1777,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_autotagging",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -1590,6 +1790,7 @@ if _module_enabled("system"):
             """Delete autotagging by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/autotagging/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -1615,7 +1816,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_autotagging",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -1686,6 +1887,7 @@ if _module_enabled("system"):
             """Delete blocklist bulk If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/blocklist/bulk", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -1715,7 +1917,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_blocklist_bulk",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -1728,6 +1930,7 @@ if _module_enabled("system"):
             """Delete blocklist by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/blocklist/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -1753,7 +1956,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_blocklist",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("calendar"):
 
@@ -1909,6 +2112,7 @@ if _module_enabled("command"):
             """Create command If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             priority: Values: normal, high, low
             status: Values: queued, started, completed, failed, aborted, cancelled, orphaned
             result: Values: unknown, successful, unsuccessful
@@ -1976,7 +2180,7 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_command",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("command"):
 
@@ -2022,6 +2226,7 @@ if _module_enabled("command"):
             """Delete command by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/command/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -2047,7 +2252,7 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_command",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("config"):
 
@@ -2131,6 +2336,7 @@ if _module_enabled("config"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/config/downloadclient/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -2174,7 +2380,7 @@ if _module_enabled("config"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_config_downloadclient",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("config"):
 
@@ -2291,6 +2497,7 @@ if _module_enabled("config"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             authenticationMethod: Values: none, basic, forms, external
             authenticationRequired: Values: enabled, disabledForLocalAddresses
             updateMechanism: Values: builtIn, script, external, apt, docker
@@ -2405,7 +2612,7 @@ if _module_enabled("config"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_config_host",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("config"):
 
@@ -2489,6 +2696,7 @@ if _module_enabled("config"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/config/indexer/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -2532,7 +2740,7 @@ if _module_enabled("config"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_config_indexer",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("config"):
 
@@ -2633,6 +2841,7 @@ if _module_enabled("config"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             downloadPropersAndRepacks: Values: preferAndUpgrade, doNotUpgrade, doNotPrefer
             fileDate: Values: none, albumReleaseDate
             rescanAfterRefresh: Values: always, afterManual, never
@@ -2714,7 +2923,7 @@ if _module_enabled("config"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_config_mediamanagement",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("config"):
 
@@ -2798,6 +3007,7 @@ if _module_enabled("config"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             writeAudioTags: Values: no, newFiles, allFiles, sync
             """
             if not confirm:
@@ -2842,7 +3052,7 @@ if _module_enabled("config"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_config_metadataprovider",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("config"):
 
@@ -3010,6 +3220,7 @@ if _module_enabled("config"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/config/naming/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -3069,7 +3280,7 @@ if _module_enabled("config"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_config_naming",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("config"):
 
@@ -3163,6 +3374,7 @@ if _module_enabled("config"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/config/ui/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -3226,7 +3438,7 @@ if _module_enabled("config"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_config_ui",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -3279,6 +3491,7 @@ if _module_enabled("system"):
             """Create custom filter If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             filters:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
             if not confirm:
@@ -3313,7 +3526,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_custom_filter",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -3364,6 +3577,7 @@ if _module_enabled("system"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             filters:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
             if not confirm:
@@ -3406,7 +3620,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_custom_filter",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -3419,6 +3633,7 @@ if _module_enabled("system"):
             """Delete custom filter by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/customfilter/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -3444,7 +3659,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_custom_filter",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
 
@@ -3497,6 +3712,7 @@ if _module_enabled("quality"):
             """Create custom format If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             specifications:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
             if not confirm:
@@ -3531,7 +3747,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_custom_format",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
     if not LIDARR_READ_ONLY:
@@ -3545,6 +3761,7 @@ if _module_enabled("quality"):
             """Update custom formats bulk If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/customformat/bulk", "confirm": "Set confirm=True to execute this PUT request."}
@@ -3577,7 +3794,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_custom_formats_bulk",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
     if not LIDARR_READ_ONLY:
@@ -3591,6 +3808,7 @@ if _module_enabled("quality"):
             """Delete custom formats bulk If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/customformat/bulk", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -3622,7 +3840,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_custom_formats_bulk",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
 
@@ -3705,6 +3923,7 @@ if _module_enabled("quality"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             specifications:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
             if not confirm:
@@ -3747,7 +3966,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_custom_format",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
     if not LIDARR_READ_ONLY:
@@ -3760,6 +3979,7 @@ if _module_enabled("quality"):
             """Delete custom format by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/customformat/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -3785,7 +4005,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_custom_format",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
 
@@ -3845,6 +4065,7 @@ if _module_enabled("quality"):
             """Create delay profile If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             preferredProtocol: Values: unknown, usenet, torrent
             """
             if not confirm:
@@ -3893,7 +4114,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_delay_profile",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
     if not LIDARR_READ_ONLY:
@@ -3909,6 +4130,7 @@ if _module_enabled("quality"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/delayprofile/reorder/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -3946,7 +4168,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_delay_profiles_reorder",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
 
@@ -4004,6 +4226,7 @@ if _module_enabled("quality"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             preferredProtocol: Values: unknown, usenet, torrent
             """
             if not confirm:
@@ -4060,7 +4283,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_delay_profile",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
     if not LIDARR_READ_ONLY:
@@ -4073,6 +4296,7 @@ if _module_enabled("quality"):
             """Delete delay profile by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/delayprofile/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -4098,7 +4322,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_delay_profile",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -4201,6 +4425,7 @@ if _module_enabled("downloadclient"):
             """Create download client If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             protocol: Values: unknown, usenet, torrent
@@ -4263,7 +4488,7 @@ if _module_enabled("downloadclient"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_download_client",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("downloadclient"):
     if not LIDARR_READ_ONLY:
@@ -4289,6 +4514,7 @@ if _module_enabled("downloadclient"):
             """Create download clients action If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             protocol: Values: unknown, usenet, torrent
@@ -4345,7 +4571,7 @@ if _module_enabled("downloadclient"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_download_clients_action",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("downloadclient"):
     if not LIDARR_READ_ONLY:
@@ -4364,6 +4590,7 @@ if _module_enabled("downloadclient"):
             """Update download clients bulk If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             applyTags: Values: add, remove, replace
             """
             if not confirm:
@@ -4407,7 +4634,7 @@ if _module_enabled("downloadclient"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_download_clients_bulk",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("downloadclient"):
     if not LIDARR_READ_ONLY:
@@ -4426,6 +4653,7 @@ if _module_enabled("downloadclient"):
             """Delete download clients bulk If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             applyTags: Values: add, remove, replace
             """
             if not confirm:
@@ -4468,7 +4696,7 @@ if _module_enabled("downloadclient"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_download_clients_bulk",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("downloadclient"):
 
@@ -4533,6 +4761,7 @@ if _module_enabled("downloadclient"):
             """Create download clients test If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             protocol: Values: unknown, usenet, torrent
@@ -4595,7 +4824,7 @@ if _module_enabled("downloadclient"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_download_clients_test",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("downloadclient"):
     if not LIDARR_READ_ONLY:
@@ -4607,6 +4836,7 @@ if _module_enabled("downloadclient"):
             """Create download clients testall If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/downloadclient/testall", "confirm": "Set confirm=True to execute this POST request."}
@@ -4632,7 +4862,7 @@ if _module_enabled("downloadclient"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_download_clients_testall",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("downloadclient"):
 
@@ -4695,6 +4925,7 @@ if _module_enabled("downloadclient"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             protocol: Values: unknown, usenet, torrent
@@ -4765,7 +4996,7 @@ if _module_enabled("downloadclient"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_download_client",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("downloadclient"):
     if not LIDARR_READ_ONLY:
@@ -4778,6 +5009,7 @@ if _module_enabled("downloadclient"):
             """Delete download client by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/downloadclient/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -4803,7 +5035,7 @@ if _module_enabled("downloadclient"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_download_client",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -5112,6 +5344,7 @@ if _module_enabled("history"):
             """Create history failed If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/history/failed/{id}", "confirm": "Set confirm=True to execute this POST request."}
@@ -5137,7 +5370,7 @@ if _module_enabled("history"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_history_failed",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("history"):
 
@@ -5264,6 +5497,7 @@ if _module_enabled("importlist"):
             """Create import list If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             shouldMonitor: Values: none, specificAlbum, entireArtist
@@ -5340,7 +5574,7 @@ if _module_enabled("importlist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_import_list",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("importlist"):
     if not LIDARR_READ_ONLY:
@@ -5372,6 +5606,7 @@ if _module_enabled("importlist"):
             """Create import lists action If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             shouldMonitor: Values: none, specificAlbum, entireArtist
@@ -5442,7 +5677,7 @@ if _module_enabled("importlist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_import_lists_action",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("importlist"):
     if not LIDARR_READ_ONLY:
@@ -5460,6 +5695,7 @@ if _module_enabled("importlist"):
             """Update import lists bulk If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             applyTags: Values: add, remove, replace
             """
             if not confirm:
@@ -5501,7 +5737,7 @@ if _module_enabled("importlist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_import_lists_bulk",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("importlist"):
     if not LIDARR_READ_ONLY:
@@ -5519,6 +5755,7 @@ if _module_enabled("importlist"):
             """Delete import lists bulk If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             applyTags: Values: add, remove, replace
             """
             if not confirm:
@@ -5559,7 +5796,7 @@ if _module_enabled("importlist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_import_lists_bulk",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("importlist"):
 
@@ -5630,6 +5867,7 @@ if _module_enabled("importlist"):
             """Create import lists test If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             shouldMonitor: Values: none, specificAlbum, entireArtist
@@ -5706,7 +5944,7 @@ if _module_enabled("importlist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_import_lists_test",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("importlist"):
     if not LIDARR_READ_ONLY:
@@ -5718,6 +5956,7 @@ if _module_enabled("importlist"):
             """Create import lists testall If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/importlist/testall", "confirm": "Set confirm=True to execute this POST request."}
@@ -5743,7 +5982,7 @@ if _module_enabled("importlist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_import_lists_testall",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("importlist"):
 
@@ -5812,6 +6051,7 @@ if _module_enabled("importlist"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             shouldMonitor: Values: none, specificAlbum, entireArtist
@@ -5896,7 +6136,7 @@ if _module_enabled("importlist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_import_list",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("importlist"):
     if not LIDARR_READ_ONLY:
@@ -5909,6 +6149,7 @@ if _module_enabled("importlist"):
             """Delete import list by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/importlist/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -5934,7 +6175,7 @@ if _module_enabled("importlist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_import_list",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("importlist"):
 
@@ -5986,6 +6227,7 @@ if _module_enabled("importlist"):
             """Create import list exclusion If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/importlistexclusion", "confirm": "Set confirm=True to execute this POST request."}
@@ -6017,7 +6259,7 @@ if _module_enabled("importlist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_import_list_exclusion",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("importlist"):
 
@@ -6067,6 +6309,7 @@ if _module_enabled("importlist"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/importlistexclusion/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -6106,7 +6349,7 @@ if _module_enabled("importlist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_import_list_exclusion",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("importlist"):
     if not LIDARR_READ_ONLY:
@@ -6119,6 +6362,7 @@ if _module_enabled("importlist"):
             """Delete import list exclusion by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/importlistexclusion/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -6144,7 +6388,7 @@ if _module_enabled("importlist"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_import_list_exclusion",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("indexer"):
 
@@ -6212,6 +6456,7 @@ if _module_enabled("indexer"):
             """Create indexer If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             protocol: Values: unknown, usenet, torrent
@@ -6280,7 +6525,7 @@ if _module_enabled("indexer"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_indexer",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("indexer"):
     if not LIDARR_READ_ONLY:
@@ -6309,6 +6554,7 @@ if _module_enabled("indexer"):
             """Create indexers action If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             protocol: Values: unknown, usenet, torrent
@@ -6371,7 +6617,7 @@ if _module_enabled("indexer"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_indexers_action",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("indexer"):
     if not LIDARR_READ_ONLY:
@@ -6390,6 +6636,7 @@ if _module_enabled("indexer"):
             """Update indexers bulk If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             applyTags: Values: add, remove, replace
             """
             if not confirm:
@@ -6433,7 +6680,7 @@ if _module_enabled("indexer"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_indexers_bulk",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("indexer"):
     if not LIDARR_READ_ONLY:
@@ -6452,6 +6699,7 @@ if _module_enabled("indexer"):
             """Delete indexers bulk If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             applyTags: Values: add, remove, replace
             """
             if not confirm:
@@ -6494,7 +6742,7 @@ if _module_enabled("indexer"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_indexers_bulk",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("indexer"):
 
@@ -6562,6 +6810,7 @@ if _module_enabled("indexer"):
             """Create indexers test If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             protocol: Values: unknown, usenet, torrent
@@ -6630,7 +6879,7 @@ if _module_enabled("indexer"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_indexers_test",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("indexer"):
     if not LIDARR_READ_ONLY:
@@ -6642,6 +6891,7 @@ if _module_enabled("indexer"):
             """Create indexers testall If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/indexer/testall", "confirm": "Set confirm=True to execute this POST request."}
@@ -6667,7 +6917,7 @@ if _module_enabled("indexer"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_indexers_testall",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("indexer"):
 
@@ -6733,6 +6983,7 @@ if _module_enabled("indexer"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             protocol: Values: unknown, usenet, torrent
@@ -6809,7 +7060,7 @@ if _module_enabled("indexer"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_indexer",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("indexer"):
     if not LIDARR_READ_ONLY:
@@ -6822,6 +7073,7 @@ if _module_enabled("indexer"):
             """Delete indexer by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/indexer/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -6847,7 +7099,7 @@ if _module_enabled("indexer"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_indexer",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("indexer"):
 
@@ -7259,6 +7511,7 @@ if _module_enabled("command"):
             """Create manual import If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             body: Request body (array)
             """
             if not confirm:
@@ -7288,7 +7541,7 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_manual_import",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -7417,6 +7670,7 @@ if _module_enabled("system"):
             """Create metadata If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -7470,7 +7724,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_metadata",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -7492,6 +7746,7 @@ if _module_enabled("system"):
             """Create metadata action If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -7539,7 +7794,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_metadata_action",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -7600,6 +7855,7 @@ if _module_enabled("system"):
             """Create metadata test If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -7653,7 +7909,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_metadata_test",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -7665,6 +7921,7 @@ if _module_enabled("system"):
             """Create metadata testall If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/metadata/testall", "confirm": "Set confirm=True to execute this POST request."}
@@ -7690,7 +7947,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_metadata_testall",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -7749,6 +8006,7 @@ if _module_enabled("system"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -7810,7 +8068,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_metadata",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -7823,6 +8081,7 @@ if _module_enabled("system"):
             """Delete metadata by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/metadata/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -7848,7 +8107,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_metadata",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -7902,6 +8161,7 @@ if _module_enabled("system"):
             """Create metadata profile If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             primaryAlbumTypes:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             secondaryAlbumTypes:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             releaseStatuses:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
@@ -7940,7 +8200,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_metadata_profile",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -8024,6 +8284,7 @@ if _module_enabled("system"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             primaryAlbumTypes:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             secondaryAlbumTypes:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             releaseStatuses:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
@@ -8070,7 +8331,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_metadata_profile",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -8083,6 +8344,7 @@ if _module_enabled("system"):
             """Delete metadata profile by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/metadataprofile/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -8108,7 +8370,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_metadata_profile",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -8197,6 +8459,7 @@ if _module_enabled("system"):
             """Create notification If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -8306,7 +8569,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_notification",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -8356,6 +8619,7 @@ if _module_enabled("system"):
             """Create notifications action If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -8459,7 +8723,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_notifications_action",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -8548,6 +8812,7 @@ if _module_enabled("system"):
             """Create notifications test If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -8657,7 +8922,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_notifications_test",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -8669,6 +8934,7 @@ if _module_enabled("system"):
             """Create notifications testall If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/notification/testall", "confirm": "Set confirm=True to execute this POST request."}
@@ -8694,7 +8960,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_notifications_testall",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -8781,6 +9047,7 @@ if _module_enabled("system"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -8898,7 +9165,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_notification",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -8911,6 +9178,7 @@ if _module_enabled("system"):
             """Delete notification by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/notification/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -8936,7 +9204,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_notification",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -9024,6 +9292,7 @@ if _module_enabled("quality"):
             """Update quality definitions update If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             body: Request body (array)
             """
             if not confirm:
@@ -9054,7 +9323,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_quality_definitions_update",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
 
@@ -9108,6 +9377,7 @@ if _module_enabled("quality"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/qualitydefinition/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -9155,7 +9425,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_quality_definition",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
 
@@ -9212,6 +9482,7 @@ if _module_enabled("quality"):
             """Create quality profile If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             items:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             formatItems:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -9255,7 +9526,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_quality_profile",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
 
@@ -9342,6 +9613,7 @@ if _module_enabled("quality"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             items:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             formatItems:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -9393,7 +9665,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_quality_profile",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("quality"):
     if not LIDARR_READ_ONLY:
@@ -9406,6 +9678,7 @@ if _module_enabled("quality"):
             """Delete quality profile by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/qualityprofile/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -9431,7 +9704,7 @@ if _module_enabled("quality"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_quality_profile",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("queue"):
 
@@ -9525,6 +9798,7 @@ if _module_enabled("queue"):
             """Delete queue bulk If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/queue/bulk", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -9564,7 +9838,7 @@ if _module_enabled("queue"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_queue_bulk",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("queue"):
 
@@ -9629,6 +9903,7 @@ if _module_enabled("queue"):
             """Create queue grab bulk If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/queue/grab/bulk", "confirm": "Set confirm=True to execute this POST request."}
@@ -9658,7 +9933,7 @@ if _module_enabled("queue"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_queue_grab_bulk",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("queue"):
     if not LIDARR_READ_ONLY:
@@ -9671,6 +9946,7 @@ if _module_enabled("queue"):
             """Create queue grab If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/queue/grab/{id}", "confirm": "Set confirm=True to execute this POST request."}
@@ -9696,7 +9972,7 @@ if _module_enabled("queue"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_queue_grab",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("queue"):
 
@@ -9745,6 +10021,7 @@ if _module_enabled("queue"):
             """Delete queue by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/queue/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -9780,7 +10057,7 @@ if _module_enabled("queue"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_queue",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("release"):
 
@@ -9878,6 +10155,7 @@ if _module_enabled("release"):
             """Create release If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             customFormats:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             protocol: Values: unknown, usenet, torrent
             """
@@ -9987,7 +10265,7 @@ if _module_enabled("release"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_release",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("release"):
     if not LIDARR_READ_ONLY:
@@ -10039,6 +10317,7 @@ if _module_enabled("release"):
             """Create releases push If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             customFormats:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             protocol: Values: unknown, usenet, torrent
             """
@@ -10148,7 +10427,7 @@ if _module_enabled("release"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_releases_push",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("release"):
 
@@ -10203,6 +10482,7 @@ if _module_enabled("release"):
             """Create release profile If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/releaseprofile", "confirm": "Set confirm=True to execute this POST request."}
@@ -10240,7 +10520,7 @@ if _module_enabled("release"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_release_profile",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("release"):
 
@@ -10293,6 +10573,7 @@ if _module_enabled("release"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/releaseprofile/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -10338,7 +10619,7 @@ if _module_enabled("release"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_release_profile",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("release"):
     if not LIDARR_READ_ONLY:
@@ -10351,6 +10632,7 @@ if _module_enabled("release"):
             """Delete release profile by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/releaseprofile/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -10376,7 +10658,7 @@ if _module_enabled("release"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_release_profile",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -10429,6 +10711,7 @@ if _module_enabled("system"):
             """Create remote path mapping If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/remotepathmapping", "confirm": "Set confirm=True to execute this POST request."}
@@ -10462,7 +10745,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_remote_path_mapping",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -10513,6 +10796,7 @@ if _module_enabled("system"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/remotepathmapping/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -10554,7 +10838,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_remote_path_mapping",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -10567,6 +10851,7 @@ if _module_enabled("system"):
             """Delete remote path mapping by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/remotepathmapping/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -10592,7 +10877,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_remote_path_mapping",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("command"):
 
@@ -10744,6 +11029,7 @@ if _module_enabled("system"):
             """Create root folder If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             defaultMonitorOption: Values: all, future, missing, existing, latest, first, none, unknown
             defaultNewItemMonitorOption: Values: all, none, new
             """
@@ -10793,7 +11079,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_root_folder",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -10851,6 +11137,7 @@ if _module_enabled("system"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             defaultMonitorOption: Values: all, future, missing, existing, latest, first, none, unknown
             defaultNewItemMonitorOption: Values: all, none, new
             """
@@ -10908,7 +11195,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_root_folder",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -10921,6 +11208,7 @@ if _module_enabled("system"):
             """Delete root folder by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/rootfolder/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -10946,7 +11234,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_root_folder",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("artist"):
 
@@ -11039,6 +11327,7 @@ if _module_enabled("system"):
             """Create system backup restore upload If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/system/backup/restore/upload", "confirm": "Set confirm=True to execute this POST request."}
@@ -11064,7 +11353,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_system_backup_restore_upload",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -11077,6 +11366,7 @@ if _module_enabled("system"):
             """Create system backup restore If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/system/backup/restore/{id}", "confirm": "Set confirm=True to execute this POST request."}
@@ -11102,7 +11392,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_system_backup_restore",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -11115,6 +11405,7 @@ if _module_enabled("system"):
             """Delete system backup by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/system/backup/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -11140,7 +11431,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_system_backup",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -11152,6 +11443,7 @@ if _module_enabled("system"):
             """Create system restart If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/system/restart", "confirm": "Set confirm=True to execute this POST request."}
@@ -11177,7 +11469,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_system_restart",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -11253,6 +11545,7 @@ if _module_enabled("system"):
             """Create system shutdown If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/system/shutdown", "confirm": "Set confirm=True to execute this POST request."}
@@ -11278,7 +11571,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_system_shutdown",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -11432,6 +11725,7 @@ if _module_enabled("system"):
             """Create tag If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/tag", "confirm": "Set confirm=True to execute this POST request."}
@@ -11461,7 +11755,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_tag",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -11581,6 +11875,7 @@ if _module_enabled("system"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/tag/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -11618,7 +11913,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_tag",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
     if not LIDARR_READ_ONLY:
@@ -11631,6 +11926,7 @@ if _module_enabled("system"):
             """Delete tag by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/tag/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -11656,7 +11952,7 @@ if _module_enabled("system"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_tag",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("track"):
 
@@ -11809,6 +12105,7 @@ if _module_enabled("track"):
             """Delete track files bulk If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/trackfile/bulk", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -11844,7 +12141,7 @@ if _module_enabled("track"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_track_files_bulk",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("track"):
     if not LIDARR_READ_ONLY:
@@ -11860,6 +12157,7 @@ if _module_enabled("track"):
             """Edit track files If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/trackfile/editor", "confirm": "Set confirm=True to execute this PUT request."}
@@ -11896,7 +12194,7 @@ if _module_enabled("track"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_edit_track_files",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("track"):
 
@@ -11959,6 +12257,7 @@ if _module_enabled("track"):
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             customFormats:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
             if not confirm:
@@ -12025,7 +12324,7 @@ if _module_enabled("track"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_update_track_file",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("track"):
     if not LIDARR_READ_ONLY:
@@ -12038,6 +12337,7 @@ if _module_enabled("track"):
             """Delete track file by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "DELETE /api/v1/trackfile/{id}", "confirm": "Set confirm=True to execute this DELETE request."}
@@ -12063,7 +12363,7 @@ if _module_enabled("track"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_delete_track_file",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("system"):
 
@@ -12386,6 +12686,7 @@ if _module_enabled("auth"):
             """Create login If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /login", "confirm": "Set confirm=True to execute this POST request."}
@@ -12415,7 +12716,7 @@ if _module_enabled("auth"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_login",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("auth"):
 
@@ -12460,6 +12761,7 @@ if _module_enabled("command"):
             """Trigger a download search for specific albums. If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             albumIds: List of album IDs to search for downloads.
             """
             if not confirm:
@@ -12489,7 +12791,7 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_command_album_search",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("command"):
     if not LIDARR_READ_ONLY:
@@ -12502,6 +12804,7 @@ if _module_enabled("command"):
             """Trigger a download search for all monitored albums of an artist. If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             artistId: The artist ID to search for.
             """
             if not confirm:
@@ -12531,7 +12834,7 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_command_artist_search",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("command"):
     if not LIDARR_READ_ONLY:
@@ -12544,6 +12847,7 @@ if _module_enabled("command"):
             """Refresh artist metadata and album list from MusicBrainz. If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             artistId: Artist ID to refresh. Omit to refresh all.
             """
             if not confirm:
@@ -12574,7 +12878,7 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_command_refresh_artist",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("command"):
     if not LIDARR_READ_ONLY:
@@ -12587,6 +12891,7 @@ if _module_enabled("command"):
             """Rescan an artist's folder on disk for new or changed files. If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             artistId: Artist ID to rescan. Omit to rescan all.
             """
             if not confirm:
@@ -12617,7 +12922,7 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_command_rescan_artist",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 
 if _module_enabled("command"):
     if not LIDARR_READ_ONLY:
@@ -12629,6 +12934,7 @@ if _module_enabled("command"):
             """Search for all missing (monitored, not downloaded) albums. If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
                 return {"preview": "POST /api/v1/command", "confirm": "Set confirm=True to execute this POST request."}
@@ -12656,5 +12962,5 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_command_missing_album_search",
                 }
-            return _resp
+            return _compact_mutation_response(_resp)
 

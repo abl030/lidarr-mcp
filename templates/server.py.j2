@@ -136,6 +136,16 @@ def _compact_object(row: dict[str, Any]) -> dict[str, Any]:
     return {k: _compact_value(v) for k, v in row.items()}
 
 
+def _compact_mutation_response(resp: Any) -> dict[str, Any] | list[Any]:
+    """Compact a mutation response to save context window."""
+    if isinstance(resp, list):
+        ids = [item.get("id") for item in resp if isinstance(item, dict)]
+        return {"ok": True, "count": len(resp), "ids": ids}
+    if isinstance(resp, dict):
+        return _compact_object(resp)
+    return resp
+
+
 def _filter_response(
     data: list[dict[str, Any]],
     fields: str = "",
@@ -239,6 +249,184 @@ async def lidarr_report_issue(
 
 
 # ---------------------------------------------------------------------------
+# High-level workflow tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def lidarr_grab_album(
+    artist: str = "",
+    album: str = "",
+    foreignArtistId: str = "",
+    qualityProfileId: int | None = None,
+    metadataProfileId: int | None = None,
+    rootFolderPath: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Grab a specific album: look up artist, add to library if missing, monitor the album, and trigger download search.
+
+    Requires confirm=True to execute. Set confirm=False to preview.
+    artist: Artist name to search for (e.g. "DJ Harrison"). Required unless foreignArtistId is provided.
+    album: Album title to match (case-insensitive substring match, e.g. "ElectroSoul").
+    foreignArtistId: MusicBrainz artist ID. Use this to bypass Lidarr's search API when it's unavailable.
+    qualityProfileId: Quality profile ID. Defaults to LIDARR_DEFAULT_QUALITY_PROFILE_ID env var.
+    rootFolderPath: Root folder path. Defaults to LIDARR_DEFAULT_ROOT_FOLDER env var.
+    metadataProfileId: Metadata profile ID. Defaults to 1.
+    Returns {"ok": true, "artistId": ..., "albumId": ..., "albumTitle": ..., "status": "search_triggered"} on success.
+    If the album title doesn't match, returns available album titles so you can retry with the correct name.
+    If unexpected errors occur, call lidarr_report_issue.
+    """
+    if not confirm:
+        return {"preview": "grab_album workflow", "confirm": "Set confirm=True to execute.", "artist": artist, "album": album}
+
+    # Resolve defaults
+    if qualityProfileId is None and LIDARR_DEFAULT_QUALITY_PROFILE_ID:
+        qualityProfileId = int(LIDARR_DEFAULT_QUALITY_PROFILE_ID)
+    if rootFolderPath is None and LIDARR_DEFAULT_ROOT_FOLDER:
+        rootFolderPath = LIDARR_DEFAULT_ROOT_FOLDER
+    if metadataProfileId is None:
+        metadataProfileId = 1
+
+    # Step 1: Resolve artist
+    if not foreignArtistId and not artist:
+        return {"error": True, "step": "resolve_artist", "message": "Provide either 'artist' name or 'foreignArtistId'."}
+
+    artist_id: int | None = None
+    artist_name: str = artist
+
+    if foreignArtistId:
+        # Check if artist already in library by foreignArtistId
+        try:
+            existing = await _client.request("GET", "/api/v1/artist")
+            if isinstance(existing, list):
+                for a in existing:
+                    if isinstance(a, dict) and a.get("foreignArtistId") == foreignArtistId:
+                        artist_id = a["id"]
+                        artist_name = a.get("artistName", artist)
+                        break
+        except Exception as exc:
+            return {"error": True, "step": "check_existing", "message": str(exc)[:500]}
+
+        if artist_id is None:
+            # Create artist using MBID
+            try:
+                created = await _client.request("POST", "/api/v1/artist", json_body={
+                    "foreignArtistId": foreignArtistId,
+                    "artistName": artist_name or foreignArtistId,
+                    "qualityProfileId": qualityProfileId,
+                    "metadataProfileId": metadataProfileId,
+                    "rootFolderPath": rootFolderPath,
+                    "monitored": True,
+                    "addOptions": {"monitor": "none", "searchForMissingAlbums": False},
+                })
+                if isinstance(created, dict) and "id" in created:
+                    artist_id = created["id"]
+                    artist_name = created.get("artistName", artist_name)
+                else:
+                    return {"error": True, "step": "create_artist", "message": f"Unexpected response: {str(created)[:300]}"}
+            except httpx.HTTPStatusError as exc:
+                return {"error": True, "step": "create_artist", "status": exc.response.status_code, "message": exc.response.text[:500]}
+            except Exception as exc:
+                return {"error": True, "step": "create_artist", "message": str(exc)[:500]}
+    else:
+        # Lookup artist by name
+        try:
+            lookup = await _client.request("GET", "/api/v1/artist/lookup", params={"term": _normalize_unicode(artist)})
+        except Exception as exc:
+            return {"error": True, "step": "lookup_artist", "message": str(exc)[:500]}
+
+        if not isinstance(lookup, list) or len(lookup) == 0:
+            return {"error": True, "step": "lookup_artist", "message": f"No results for '{artist}'. Try foreignArtistId instead."}
+
+        best = lookup[0]
+        foreign_id = best.get("foreignArtistId", "")
+        artist_name = best.get("artistName", artist)
+
+        # Check if already in library
+        try:
+            existing = await _client.request("GET", "/api/v1/artist")
+            if isinstance(existing, list):
+                for a in existing:
+                    if isinstance(a, dict) and a.get("foreignArtistId") == foreign_id:
+                        artist_id = a["id"]
+                        break
+        except Exception:
+            pass
+
+        if artist_id is None:
+            # Create artist
+            try:
+                created = await _client.request("POST", "/api/v1/artist", json_body={
+                    "foreignArtistId": foreign_id,
+                    "artistName": artist_name,
+                    "qualityProfileId": qualityProfileId,
+                    "metadataProfileId": metadataProfileId,
+                    "rootFolderPath": rootFolderPath,
+                    "monitored": True,
+                    "addOptions": {"monitor": "none", "searchForMissingAlbums": False},
+                })
+                if isinstance(created, dict) and "id" in created:
+                    artist_id = created["id"]
+                else:
+                    return {"error": True, "step": "create_artist", "message": f"Unexpected response: {str(created)[:300]}"}
+            except httpx.HTTPStatusError as exc:
+                return {"error": True, "step": "create_artist", "status": exc.response.status_code, "message": exc.response.text[:500]}
+            except Exception as exc:
+                return {"error": True, "step": "create_artist", "message": str(exc)[:500]}
+
+    # Step 2: List albums for this artist (retry — metadata refresh may be in progress)
+    import asyncio as _asyncio
+    albums: list[Any] = []
+    for _attempt in range(6):
+        try:
+            resp = await _client.request("GET", "/api/v1/album", params={"artistId": artist_id})
+            if isinstance(resp, list) and len(resp) > 0:
+                albums = resp
+                break
+        except Exception:
+            pass
+        await _asyncio.sleep(2)
+
+    if not albums:
+        return {"error": True, "step": "list_albums", "artistId": artist_id, "message": "No albums found after waiting. Metadata may still be loading — try again shortly."}
+
+    # Step 3: Match album title
+    album_lower = album.lower()
+    match = None
+    for alb in albums:
+        if isinstance(alb, dict) and album_lower in alb.get("title", "").lower():
+            match = alb
+            break
+
+    if match is None:
+        available = [a.get("title", "?") for a in albums if isinstance(a, dict)]
+        return {"error": True, "step": "match_album", "message": f"No album matching '{album}'.", "available_albums": available}
+
+    album_id = match["id"]
+    album_title = match.get("title", album)
+
+    # Step 4: Monitor the target album
+    try:
+        await _client.request("PUT", "/api/v1/album/monitor", json_body={"albumIds": [album_id], "monitored": True})
+    except Exception as exc:
+        return {"error": True, "step": "monitor_album", "albumId": album_id, "message": str(exc)[:500]}
+
+    # Step 5: Trigger download search
+    try:
+        await _client.request("POST", "/api/v1/command", json_body={"name": "AlbumSearch", "albumIds": [album_id]})
+    except Exception as exc:
+        return {"error": True, "step": "album_search", "albumId": album_id, "message": str(exc)[:500]}
+
+    return {
+        "ok": True,
+        "artistId": artist_id,
+        "artistName": artist_name,
+        "albumId": album_id,
+        "albumTitle": album_title,
+        "status": "search_triggered",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Generated tools
 # ---------------------------------------------------------------------------
 
@@ -291,6 +479,7 @@ if _module_enabled("{{ tool.module }}"):
 {% if tool.method == "put" and "{id}" in tool.path %}
 {{ indent }}    merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
 {% endif %}
+{{ indent }}    Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
 {% for p in tool.params %}
 {% if p.description %}
 {{ indent }}    {{ p.name }}: {{ p.description }}
@@ -456,6 +645,10 @@ if _module_enabled("{{ tool.module }}"):
 {{ indent }}        filtered["pageSize"] = _resp.get("pageSize", 10)
 {{ indent }}        return filtered
 {% endif %}
+{% if tool.is_mutation %}
+{{ indent }}    return _compact_mutation_response(_resp)
+{% else %}
 {{ indent }}    return _resp
+{% endif %}
 
 {% endfor %}
