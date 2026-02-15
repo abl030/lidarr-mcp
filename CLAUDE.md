@@ -234,3 +234,32 @@ Deliverables:
 - `tests/test_integration.py`: Updated `query=` → `filter=` in 2 places.
 - `generated/server.py`: Regenerated with all changes.
 - Total tests: 120 (100 unit + 20 integration).
+
+### Issue #2: PUT endpoints need better error handling and partial update support
+Status: COMPLETE
+
+Goal: Fix real-world issues where Lidarr's PUT endpoints require the full object for updates, causing 500 errors when callers only provide changed fields.
+
+#### 2a — Synthetic PATCH via `merge` parameter on PUT tools
+Added `merge: bool = True` to PUT mutation tool signatures (only for single-resource PUTs where `{id}` is in the path — not batch/bulk endpoints like `lidarr_monitor_album`).
+When `merge=True`: GET the current object, deep-merge caller's non-None fields on top, then PUT the complete result.
+When `merge=False`: current behavior (send only explicitly-provided fields).
+Safety guard: only merge when GET returns a dict with `"id"` key; on GET failure, silently fall back to non-merge behavior.
+
+#### 2b — Better error messages for PUT endpoints
+Added `"hint": "PUT requires the full object. Use merge=True to auto-fetch and merge."` to the `httpx.HTTPStatusError` error dict for all PUT tools.
+
+#### 2c — Workflow hint updates
+Updated `_WORKFLOW_HINTS` for `lidarr_update_artist` and `lidarr_update_album` to mention `merge=True` default behavior.
+
+#### 2d — Tests
+- `tests/test_issue2.py`: 11 new unit tests covering merge param presence/absence, merge logic block, error hints, docstrings, and workflow hints.
+- `tests/test_integration.py`: Added `test_update_artist_merge_partial` — partial update with only `monitored=True` and `merge=True`.
+
+Deliverables:
+- `templates/server.py.j2`: `merge` param in PUT signatures (gated on `{id}` in path), merge GET-then-merge logic before API call, `hint` in PUT error responses, docstring note for merge.
+- `generator/context_builder.py`: Updated `_WORKFLOW_HINTS` for update tools to mention merge=True.
+- `tests/test_issue2.py`: 11 new unit tests.
+- `tests/test_integration.py`: 1 new integration test (merge partial update).
+- `generated/server.py`: Regenerated with all changes (235 tools, 28 PUT tools with merge).
+- Total tests: 132 (111 unit + 21 integration).

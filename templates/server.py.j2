@@ -281,10 +281,16 @@ if _module_enabled("{{ tool.module }}"):
 {% endif %}
 {% endfor %}
 {{ indent }}    confirm: bool = False,
+{% if tool.method == "put" and "{id}" in tool.path %}
+{{ indent }}    merge: bool = True,
+{% endif %}
 {{ indent }}) -> dict[str, Any] | list[Any] | str:
 {{ indent }}    """{{ tool.description }}
 
 {{ indent }}    Requires confirm=True to execute. Set confirm=False to preview.
+{% if tool.method == "put" and "{id}" in tool.path %}
+{{ indent }}    merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+{% endif %}
 {% for p in tool.params %}
 {% if p.description %}
 {{ indent }}    {{ p.name }}: {{ p.description }}
@@ -399,6 +405,15 @@ if _module_enabled("{{ tool.module }}"):
 {% endif %}
 {% endfor %}
 {% endif %}
+{% if tool.method == "put" and "{id}" in tool.path %}
+{{ indent }}    if merge:
+{{ indent }}        try:
+{{ indent }}            _existing = await _client.request("GET", _path)
+{{ indent }}            if isinstance(_existing, dict) and "id" in _existing:
+{{ indent }}                _body = {**_existing, **_body}
+{{ indent }}        except Exception:
+{{ indent }}            pass
+{% endif %}
 {{ indent }}    try:
 {{ indent }}        _resp = await _client.request(
 {{ indent }}            "{{ tool.method | upper }}",
@@ -417,6 +432,9 @@ if _module_enabled("{{ tool.module }}"):
 {{ indent }}            "status": exc.response.status_code,
 {{ indent }}            "message": exc.response.text[:500],
 {{ indent }}            "tool": "{{ tool.name }}",
+{% if tool.method == "put" %}
+{{ indent }}            "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
+{% endif %}
 {{ indent }}        }
 {{ indent }}    except httpx.RequestError as exc:
 {{ indent }}        return {

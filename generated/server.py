@@ -485,6 +485,7 @@ if _module_enabled("album"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_monitor_album",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -559,10 +560,12 @@ if _module_enabled("album"):
             addOptions: dict | None = None,
             remoteCover: str | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
-            """Update album by ID If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_create_command with name='RefreshArtist' after updating.
+            """Update album by ID If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_create_command with name='RefreshArtist' after updating. Uses merge=True by default to auto-fetch the current object.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             releases:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             media:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             images:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
@@ -618,6 +621,13 @@ if _module_enabled("album"):
                 _body["addOptions"] = addOptions
             if remoteCover is not None:
                 _body["remoteCover"] = remoteCover
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -631,6 +641,7 @@ if _module_enabled("album"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_album",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -987,6 +998,7 @@ if _module_enabled("artist"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_edit_artists",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -1189,10 +1201,12 @@ if _module_enabled("artist"):
             ratings: dict | None = None,
             statistics: dict | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
-            """Update artist by ID If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_create_command with name='RefreshArtist' after updating.
+            """Update artist by ID If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_create_command with name='RefreshArtist' after updating. Uses merge=True by default to auto-fetch the current object.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             status: Values: continuing, ended, deleted
             links:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             images:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
@@ -1268,6 +1282,13 @@ if _module_enabled("artist"):
                 _body["ratings"] = ratings
             if statistics is not None:
                 _body["statistics"] = statistics
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -1282,6 +1303,7 @@ if _module_enabled("artist"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_artist",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -1505,10 +1527,12 @@ if _module_enabled("system"):
             tags: list[int] | None = None,
             specifications: list[dict] | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update autotagging by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             specifications:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
             if not confirm:
@@ -1523,6 +1547,13 @@ if _module_enabled("system"):
                 _body["tags"] = tags
             if specifications is not None:
                 _body["specifications"] = specifications
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -1536,6 +1567,7 @@ if _module_enabled("system"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_autotagging",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -2093,10 +2125,12 @@ if _module_enabled("config"):
             autoRedownloadFailed: bool | None = None,
             autoRedownloadFailedFromInteractiveSearch: bool | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update config downloadclient by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/config/downloadclient/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -2110,6 +2144,13 @@ if _module_enabled("config"):
                 _body["autoRedownloadFailed"] = autoRedownloadFailed
             if autoRedownloadFailedFromInteractiveSearch is not None:
                 _body["autoRedownloadFailedFromInteractiveSearch"] = autoRedownloadFailedFromInteractiveSearch
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -2123,6 +2164,7 @@ if _module_enabled("config"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_config_downloadclient",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -2243,10 +2285,12 @@ if _module_enabled("config"):
             backupRetention: int | None = None,
             trustCgnatIpAddresses: bool | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update config host by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             authenticationMethod: Values: none, basic, forms, external
             authenticationRequired: Values: enabled, disabledForLocalAddresses
             updateMechanism: Values: builtIn, script, external, apt, docker
@@ -2331,6 +2375,13 @@ if _module_enabled("config"):
                 _body["backupRetention"] = backupRetention
             if trustCgnatIpAddresses is not None:
                 _body["trustCgnatIpAddresses"] = trustCgnatIpAddresses
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -2344,6 +2395,7 @@ if _module_enabled("config"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_config_host",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -2431,10 +2483,12 @@ if _module_enabled("config"):
             retention: int | None = None,
             rssSyncInterval: int | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update config indexer by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/config/indexer/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -2448,6 +2502,13 @@ if _module_enabled("config"):
                 _body["retention"] = retention
             if rssSyncInterval is not None:
                 _body["rssSyncInterval"] = rssSyncInterval
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -2461,6 +2522,7 @@ if _module_enabled("config"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_config_indexer",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -2565,10 +2627,12 @@ if _module_enabled("config"):
             importExtraFiles: bool | None = None,
             extraFileExtensions: str | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update config mediamanagement by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             downloadPropersAndRepacks: Values: preferAndUpgrade, doNotUpgrade, doNotPrefer
             fileDate: Values: none, albumReleaseDate
             rescanAfterRefresh: Values: always, afterManual, never
@@ -2620,6 +2684,13 @@ if _module_enabled("config"):
                 _body["importExtraFiles"] = importExtraFiles
             if extraFileExtensions is not None:
                 _body["extraFileExtensions"] = extraFileExtensions
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -2633,6 +2704,7 @@ if _module_enabled("config"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_config_mediamanagement",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -2720,10 +2792,12 @@ if _module_enabled("config"):
             scrubAudioTags: bool | None = None,
             embedCoverArt: bool | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update config metadataprovider by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             writeAudioTags: Values: no, newFiles, allFiles, sync
             """
             if not confirm:
@@ -2738,6 +2812,13 @@ if _module_enabled("config"):
                 _body["scrubAudioTags"] = scrubAudioTags
             if embedCoverArt is not None:
                 _body["embedCoverArt"] = embedCoverArt
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -2751,6 +2832,7 @@ if _module_enabled("config"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_config_metadataprovider",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -2922,10 +3004,12 @@ if _module_enabled("config"):
             separator: str | None = None,
             numberStyle: str | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update config naming by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/config/naming/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -2955,6 +3039,13 @@ if _module_enabled("config"):
                 _body["separator"] = separator
             if numberStyle is not None:
                 _body["numberStyle"] = numberStyle
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -2968,6 +3059,7 @@ if _module_enabled("config"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_config_naming",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -3065,10 +3157,12 @@ if _module_enabled("config"):
             expandOtherByDefault: bool | None = None,
             theme: str | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update config ui by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/config/ui/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -3102,6 +3196,13 @@ if _module_enabled("config"):
                 _body["expandOtherByDefault"] = expandOtherByDefault
             if theme is not None:
                 _body["theme"] = theme
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -3115,6 +3216,7 @@ if _module_enabled("config"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_config_ui",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -3256,10 +3358,12 @@ if _module_enabled("system"):
             label: str | None = None,
             filters: list[dict] | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update custom filter by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             filters:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
             if not confirm:
@@ -3272,6 +3376,13 @@ if _module_enabled("system"):
                 _body["label"] = label
             if filters is not None:
                 _body["filters"] = filters
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -3285,6 +3396,7 @@ if _module_enabled("system"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_custom_filter",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -3455,6 +3567,7 @@ if _module_enabled("quality"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_custom_formats_bulk",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -3586,10 +3699,12 @@ if _module_enabled("quality"):
             includeCustomFormatWhenRenaming: bool | None = None,
             specifications: list[dict] | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update custom format by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             specifications:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
             if not confirm:
@@ -3602,6 +3717,13 @@ if _module_enabled("quality"):
                 _body["includeCustomFormatWhenRenaming"] = includeCustomFormatWhenRenaming
             if specifications is not None:
                 _body["specifications"] = specifications
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -3615,6 +3737,7 @@ if _module_enabled("quality"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_custom_format",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -3780,10 +3903,12 @@ if _module_enabled("quality"):
             id: int,
             afterId: int | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update delay profiles reorder by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/delayprofile/reorder/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -3791,6 +3916,13 @@ if _module_enabled("quality"):
             _params: dict[str, Any] = {}
             if afterId is not None:
                 _params["afterId"] = afterId
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -3804,6 +3936,7 @@ if _module_enabled("quality"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_delay_profiles_reorder",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -3865,10 +3998,12 @@ if _module_enabled("quality"):
             order: int | None = None,
             tags: list[int] | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update delay profile by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             preferredProtocol: Values: unknown, usenet, torrent
             """
             if not confirm:
@@ -3895,6 +4030,13 @@ if _module_enabled("quality"):
                 _body["order"] = order
             if tags is not None:
                 _body["tags"] = tags
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -3908,6 +4050,7 @@ if _module_enabled("quality"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_delay_profile",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -4254,6 +4397,7 @@ if _module_enabled("downloadclient"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_download_clients_bulk",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -4545,10 +4689,12 @@ if _module_enabled("downloadclient"):
             removeCompletedDownloads: bool | None = None,
             removeFailedDownloads: bool | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update download client by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             protocol: Values: unknown, usenet, torrent
@@ -4588,6 +4734,13 @@ if _module_enabled("downloadclient"):
                 _body["removeCompletedDownloads"] = removeCompletedDownloads
             if removeFailedDownloads is not None:
                 _body["removeFailedDownloads"] = removeFailedDownloads
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -4602,6 +4755,7 @@ if _module_enabled("downloadclient"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_download_client",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -5337,6 +5491,7 @@ if _module_enabled("importlist"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_import_lists_bulk",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -5651,10 +5806,12 @@ if _module_enabled("importlist"):
             listOrder: int | None = None,
             minRefreshInterval: str | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update import list by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             shouldMonitor: Values: none, specificAlbum, entireArtist
@@ -5708,6 +5865,13 @@ if _module_enabled("importlist"):
                 _body["listOrder"] = listOrder
             if minRefreshInterval is not None:
                 _body["minRefreshInterval"] = minRefreshInterval
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -5722,6 +5886,7 @@ if _module_enabled("importlist"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_import_list",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -5896,10 +6061,12 @@ if _module_enabled("importlist"):
             foreignId: str | None = None,
             artistName: str | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update import list exclusion by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/importlistexclusion/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -5909,6 +6076,13 @@ if _module_enabled("importlist"):
                 _body["foreignId"] = foreignId
             if artistName is not None:
                 _body["artistName"] = artistName
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -5922,6 +6096,7 @@ if _module_enabled("importlist"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_import_list_exclusion",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -6248,6 +6423,7 @@ if _module_enabled("indexer"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_indexers_bulk",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -6551,10 +6727,12 @@ if _module_enabled("indexer"):
             priority: int | None = None,
             downloadClientId: int | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update indexer by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             protocol: Values: unknown, usenet, torrent
@@ -6600,6 +6778,13 @@ if _module_enabled("indexer"):
                 _body["priority"] = priority
             if downloadClientId is not None:
                 _body["downloadClientId"] = downloadClientId
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -6614,6 +6799,7 @@ if _module_enabled("indexer"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_indexer",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -7557,10 +7743,12 @@ if _module_enabled("system"):
             presets: list[dict] | None = None,
             enable: bool | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update metadata by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -7591,6 +7779,13 @@ if _module_enabled("system"):
                 _body["presets"] = presets
             if enable is not None:
                 _body["enable"] = enable
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -7605,6 +7800,7 @@ if _module_enabled("system"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_metadata",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -7822,10 +8018,12 @@ if _module_enabled("system"):
             secondaryAlbumTypes: list[dict] | None = None,
             releaseStatuses: list[dict] | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update metadata profile by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             primaryAlbumTypes:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             secondaryAlbumTypes:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             releaseStatuses:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
@@ -7842,6 +8040,13 @@ if _module_enabled("system"):
                 _body["secondaryAlbumTypes"] = secondaryAlbumTypes
             if releaseStatuses is not None:
                 _body["releaseStatuses"] = releaseStatuses
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -7855,6 +8060,7 @@ if _module_enabled("system"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_metadata_profile",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -8569,10 +8775,12 @@ if _module_enabled("system"):
             supportsOnApplicationUpdate: bool | None = None,
             testCommand: str | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update notification by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             fields:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             presets:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -8659,6 +8867,13 @@ if _module_enabled("system"):
                 _body["supportsOnApplicationUpdate"] = supportsOnApplicationUpdate
             if testCommand is not None:
                 _body["testCommand"] = testCommand
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -8673,6 +8888,7 @@ if _module_enabled("system"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_notification",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -8828,6 +9044,7 @@ if _module_enabled("quality"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_quality_definitions_update",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -8885,10 +9102,12 @@ if _module_enabled("quality"):
             maxSize: float | None = None,
             preferredSize: float | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update quality definition by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/qualitydefinition/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -8906,6 +9125,13 @@ if _module_enabled("quality"):
                 _body["maxSize"] = maxSize
             if preferredSize is not None:
                 _body["preferredSize"] = preferredSize
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -8919,6 +9145,7 @@ if _module_enabled("quality"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_quality_definition",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -9109,10 +9336,12 @@ if _module_enabled("quality"):
             cutoffFormatScore: int | None = None,
             formatItems: list[dict] | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update quality profile by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             items:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             formatItems:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
@@ -9134,6 +9363,13 @@ if _module_enabled("quality"):
                 _body["cutoffFormatScore"] = cutoffFormatScore
             if formatItems is not None:
                 _body["formatItems"] = formatItems
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -9147,6 +9383,7 @@ if _module_enabled("quality"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_quality_profile",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -10050,10 +10287,12 @@ if _module_enabled("release"):
             indexerId: int | None = None,
             tags: list[int] | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update release profile by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/releaseprofile/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -10069,6 +10308,13 @@ if _module_enabled("release"):
                 _body["indexerId"] = indexerId
             if tags is not None:
                 _body["tags"] = tags
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -10082,6 +10328,7 @@ if _module_enabled("release"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_release_profile",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -10260,10 +10507,12 @@ if _module_enabled("system"):
             remotePath: str | None = None,
             localPath: str | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update remote path mapping by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/remotepathmapping/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -10275,6 +10524,13 @@ if _module_enabled("system"):
                 _body["remotePath"] = remotePath
             if localPath is not None:
                 _body["localPath"] = localPath
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -10288,6 +10544,7 @@ if _module_enabled("system"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_remote_path_mapping",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -10588,10 +10845,12 @@ if _module_enabled("system"):
             freeSpace: int | None = None,
             totalSpace: int | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update root folder by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             defaultMonitorOption: Values: all, future, missing, existing, latest, first, none, unknown
             defaultNewItemMonitorOption: Values: all, none, new
             """
@@ -10619,6 +10878,13 @@ if _module_enabled("system"):
                 _body["freeSpace"] = freeSpace
             if totalSpace is not None:
                 _body["totalSpace"] = totalSpace
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -10632,6 +10898,7 @@ if _module_enabled("system"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_root_folder",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -11308,10 +11575,12 @@ if _module_enabled("system"):
             id: str,
             label: str | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update tag by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             """
             if not confirm:
                 return {"preview": "PUT /api/v1/tag/{id}", "confirm": "Set confirm=True to execute this PUT request."}
@@ -11319,6 +11588,13 @@ if _module_enabled("system"):
             _body: dict[str, Any] = {}
             if label is not None:
                 _body["label"] = label
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -11332,6 +11608,7 @@ if _module_enabled("system"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_tag",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -11609,6 +11886,7 @@ if _module_enabled("track"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_edit_track_files",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -11675,10 +11953,12 @@ if _module_enabled("track"):
             qualityCutoffNotMet: bool | None = None,
             audioTags: dict | None = None,
             confirm: bool = False,
+            merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
             """Update track file by ID If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
             customFormats:  Pass as JSON array of objects. If creation fails, manage these via their dedicated sub-resource endpoints instead.
             """
             if not confirm:
@@ -11715,6 +11995,13 @@ if _module_enabled("track"):
                 _body["qualityCutoffNotMet"] = qualityCutoffNotMet
             if audioTags is not None:
                 _body["audioTags"] = audioTags
+            if merge:
+                try:
+                    _existing = await _client.request("GET", _path)
+                    if isinstance(_existing, dict) and "id" in _existing:
+                        _body = {**_existing, **_body}
+                except Exception:
+                    pass
             try:
                 _resp = await _client.request(
                     "PUT",
@@ -11728,6 +12015,7 @@ if _module_enabled("track"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_update_track_file",
+                    "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
                 }
             except httpx.RequestError as exc:
                 return {

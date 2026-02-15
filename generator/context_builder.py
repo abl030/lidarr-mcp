@@ -82,11 +82,11 @@ _WORKFLOW_HINTS: dict[str, str] = {
     ),
     "lidarr_update_artist": (
         "Note: Call lidarr_create_command with name='RefreshArtist' after"
-        " updating."
+        " updating. Uses merge=True by default to auto-fetch the current object."
     ),
     "lidarr_update_album": (
         "Note: Call lidarr_create_command with name='RefreshArtist' after"
-        " updating."
+        " updating. Uses merge=True by default to auto-fetch the current object."
     ),
     "lidarr_delete_artist": (
         "Note: Files may remain on disk unless deleteFiles=True."

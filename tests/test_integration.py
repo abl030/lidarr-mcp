@@ -274,6 +274,67 @@ async def test_crud_artist_lifecycle(server: ModuleType) -> None:
     assert gone["status"] == 404
 
 
+# ── Merge partial update ──────────────────────────────────────────────────────
+
+
+async def test_update_artist_merge_partial(server: ModuleType) -> None:
+    """Update artist with only one field using merge=True (default).
+
+    merge=True auto-fetches the existing object, merges the caller's changes,
+    and PUTs the complete result, so callers don't need to pass all fields.
+    """
+    quality_profile_id, root_folder = await _get_setup_ids(server)
+
+    # Lookup and create an artist
+    lookup = await server.lidarr_lookup_artist(term="Metallica")
+    assert isinstance(lookup, dict) and lookup["count"] > 0
+    artist_data = lookup["data"][0]
+    foreign_id = artist_data["foreignArtistId"]
+
+    # Clean up leftover from a previous run
+    existing = await server.lidarr_list_artists(filter=f"foreignArtistId={foreign_id}")
+    if isinstance(existing, dict) and existing.get("count", 0) > 0:
+        for artist in existing["data"]:
+            await server.lidarr_delete_artist(
+                id=artist["id"], deleteFiles=True, confirm=True,
+            )
+
+    created: dict[str, Any] = await server.lidarr_create_artist(
+        artistName="Metallica",
+        foreignArtistId=foreign_id,
+        qualityProfileId=quality_profile_id,
+        metadataProfileId=1,
+        rootFolderPath=root_folder,
+        monitored=False,
+        confirm=True,
+    )
+    assert isinstance(created, dict) and not created.get("error"), f"Create failed: {created}"
+    artist_id: int = created["id"]
+
+    try:
+        # Partial update: only pass monitored=True, rely on merge to fill the rest
+        updated = await server.lidarr_update_artist(
+            id=str(artist_id),
+            monitored=True,
+            merge=True,
+            confirm=True,
+        )
+        assert isinstance(updated, dict)
+        assert not updated.get("error"), f"Merge update failed: {updated}"
+        assert updated.get("monitored") is True
+
+        # Verify the update stuck
+        refetched = await server.lidarr_get_artist(id=artist_id)
+        assert isinstance(refetched, dict)
+        assert refetched["monitored"] is True
+        # Verify merge didn't lose artist name
+        assert refetched["artistName"] == "Metallica"
+    finally:
+        await server.lidarr_delete_artist(
+            id=artist_id, deleteFiles=True, confirm=True,
+        )
+
+
 # ── Command tools ────────────────────────────────────────────────────────────
 
 
