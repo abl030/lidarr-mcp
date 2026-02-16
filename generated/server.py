@@ -172,6 +172,48 @@ def _filter_response(
 
 
 # ---------------------------------------------------------------------------
+# Command polling helper
+# ---------------------------------------------------------------------------
+
+async def _poll_command(command_id: int, timeout: int = 30) -> dict[str, Any]:
+    """Poll a command until completion/failure/abort or timeout."""
+    import asyncio as _asyncio
+    elapsed = 0
+    while elapsed < timeout:
+        try:
+            status = await _client.request("GET", f"/api/v1/command/{command_id}")
+            if isinstance(status, dict):
+                state = status.get("status", "").lower()
+                if state in ("completed", "failed", "aborted"):
+                    return {"commandId": command_id, "status": state, "body": _compact_object(status)}
+        except Exception:
+            pass
+        await _asyncio.sleep(2)
+        elapsed += 2
+    return {"commandId": command_id, "status": "timeout", "elapsed": elapsed}
+
+
+# ---------------------------------------------------------------------------
+# Metadata profile summarizer
+# ---------------------------------------------------------------------------
+
+def _summarize_metadata_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    """Summarize a metadata profile, extracting allowed type/status names."""
+    result: dict[str, Any] = {}
+    _TYPE_FIELDS = ("primaryAlbumTypes", "secondaryAlbumTypes", "releaseStatuses")
+    for k, v in profile.items():
+        if k in _TYPE_FIELDS and isinstance(v, list):
+            result[k] = [
+                item.get("albumType", {}).get("name", item.get("releaseStatus", {}).get("name", "?"))
+                for item in v
+                if isinstance(item, dict) and item.get("allowed")
+            ]
+        else:
+            result[k] = _compact_value(v)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # FastMCP Server
 # ---------------------------------------------------------------------------
 
@@ -410,6 +452,15 @@ async def lidarr_grab_album(
     except Exception as exc:
         return {"error": True, "step": "monitor_album", "albumId": album_id, "message": str(exc)[:500]}
 
+    # Step 4b: Ensure parent artist is monitored (required for soularr)
+    try:
+        _artist_data = await _client.request("GET", f"/api/v1/artist/{artist_id}")
+        if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
+            _artist_data["monitored"] = True
+            await _client.request("PUT", f"/api/v1/artist/{artist_id}", json_body=_artist_data)
+    except Exception:
+        pass  # Non-fatal: album is still monitored
+
     # Step 5: Trigger download search
     try:
         await _client.request("POST", "/api/v1/command", json_body={"name": "AlbumSearch", "albumIds": [album_id]})
@@ -424,6 +475,54 @@ async def lidarr_grab_album(
         "albumTitle": album_title,
         "status": "search_triggered",
     }
+
+
+@mcp.tool()
+async def lidarr_update_albums_monitored(
+    albumIds: list[int],
+    monitored: bool,
+    ensure_artist_monitored: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Batch-update monitored status for multiple albums in a single call.
+
+    Requires confirm=True to execute. Set confirm=False to preview.
+    albumIds: List of album IDs to update.
+    monitored: Whether to monitor (True) or unmonitor (False) the albums.
+    ensure_artist_monitored: When monitored=True, automatically monitor parent artists too (default True). Required for soularr and other automation tools.
+    confirm: Must be True to execute the update.
+    Returns {"ok": true, "count": N, "ids": [...]} on success.
+    For the full add+monitor+search workflow, use lidarr_grab_album instead.
+    If unexpected errors occur, call lidarr_report_issue.
+    """
+    if not confirm:
+        return {"preview": "PUT /api/v1/album/monitor", "confirm": "Set confirm=True to execute.", "albumIds": albumIds, "monitored": monitored}
+
+    try:
+        _resp = await _client.request("PUT", "/api/v1/album/monitor", json_body={"albumIds": albumIds, "monitored": monitored})
+    except httpx.HTTPStatusError as exc:
+        return {"error": True, "source": "lidarr_api", "status": exc.response.status_code, "message": exc.response.text[:500], "tool": "lidarr_update_albums_monitored"}
+    except httpx.RequestError as exc:
+        return {"error": True, "source": "network", "status": 0, "message": str(exc)[:500], "tool": "lidarr_update_albums_monitored"}
+
+    result = _compact_mutation_response(_resp)
+
+    # Auto-monitor parent artists when setting monitored=True
+    if monitored and ensure_artist_monitored and isinstance(_resp, list):
+        _artist_ids: set[int] = set()
+        for _alb in _resp:
+            if isinstance(_alb, dict) and "artistId" in _alb:
+                _artist_ids.add(_alb["artistId"])
+        for _aid in _artist_ids:
+            try:
+                _artist_data = await _client.request("GET", f"/api/v1/artist/{_aid}")
+                if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
+                    _artist_data["monitored"] = True
+                    await _client.request("PUT", f"/api/v1/artist/{_aid}", json_body=_artist_data)
+            except Exception:
+                pass  # Non-fatal
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -649,7 +748,7 @@ if _module_enabled("album"):
             monitored: bool | None = None,
             confirm: bool = False,
         ) -> dict[str, Any] | list[Any] | str:
-            """Monitor album If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_create_command with name='AlbumSearch' to trigger a download search.
+            """Monitor album If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_create_command with name='AlbumSearch' to trigger a download search. When setting monitored=True, this tool automatically ensures the parent artist is also monitored (required for soularr and other automation tools).
 
             Requires confirm=True to execute. Set confirm=False to preview.
             Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
@@ -685,6 +784,20 @@ if _module_enabled("album"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_monitor_album",
                 }
+            # Auto-monitor parent artists when setting albums to monitored=True
+            if _body.get("monitored") and isinstance(_resp, list):
+                _artist_ids_to_check: set[int] = set()
+                for _alb in _resp:
+                    if isinstance(_alb, dict) and "artistId" in _alb:
+                        _artist_ids_to_check.add(_alb["artistId"])
+                for _aid in _artist_ids_to_check:
+                    try:
+                        _artist_data = await _client.request("GET", f"/api/v1/artist/{_aid}")
+                        if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
+                            _artist_data["monitored"] = True
+                            await _client.request("PUT", f"/api/v1/artist/{_aid}", json_body=_artist_data)
+                    except Exception:
+                        pass  # Non-fatal
             return _compact_mutation_response(_resp)
 
 if _module_enabled("album"):
@@ -752,7 +865,7 @@ if _module_enabled("album"):
             confirm: bool = False,
             merge: bool = True,
         ) -> dict[str, Any] | list[Any] | str:
-            """Update album by ID If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_create_command with name='RefreshArtist' after updating. Uses merge=True by default to auto-fetch the current object.
+            """Update album by ID If unexpected errors occur, call lidarr_report_issue. Note: Call lidarr_create_command with name='RefreshArtist' after updating. Uses merge=True by default to auto-fetch the current object. For batch album monitoring, use lidarr_update_albums_monitored instead.
 
             Requires confirm=True to execute. Set confirm=False to preview.
             merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
@@ -2108,10 +2221,14 @@ if _module_enabled("command"):
             updateScheduledTask: bool | None = None,
             lastExecutionTime: str | None = None,
             confirm: bool = False,
+            wait: bool = False,
+            wait_timeout: int = 30,
         ) -> dict[str, Any] | list[Any] | str:
             """Create command If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            wait: If True, poll until the command completes, fails, or times out (default False).
+            wait_timeout: Max seconds to wait when wait=True (default 30).
             Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             priority: Values: normal, high, low
             status: Values: queued, started, completed, failed, aborted, cancelled, orphaned
@@ -2180,7 +2297,10 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_create_command",
                 }
-            return _compact_mutation_response(_resp)
+            _result = _compact_mutation_response(_resp)
+            if wait and isinstance(_resp, dict) and "id" in _resp:
+                return await _poll_command(_resp["id"], timeout=wait_timeout)
+            return _result
 
 if _module_enabled("command"):
 
@@ -8116,7 +8236,7 @@ if _module_enabled("system"):
         fields: str = "",
         filter: str = "",
     ) -> dict[str, Any] | list[Any] | str:
-        """List metadata profiles. Returns a list. If unexpected errors occur, call lidarr_report_issue.
+        """List metadata profiles. Returns a list. If unexpected errors occur, call lidarr_report_issue. Note: Responses include summarized primaryAlbumTypes, secondaryAlbumTypes, and releaseStatuses showing only allowed type names instead of the full objects.
 
         fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
         filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
@@ -8143,6 +8263,16 @@ if _module_enabled("system"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_list_metadata_profiles",
             }
+        if isinstance(_resp, list) and not fields:
+            _summarized = [_summarize_metadata_profile(p) for p in _resp if isinstance(p, dict)]
+            if filter:
+                for pair in filter.split(","):
+                    pair = pair.strip()
+                    if "=" not in pair:
+                        continue
+                    k, v = pair.split("=", 1)
+                    _summarized = [row for row in _summarized if str(row.get(k.strip())) == v.strip()]
+            return {"summary": f"Found {len(_summarized)} items", "count": len(_summarized), "data": _summarized}
         if isinstance(_resp, list):
             return _filter_response(_resp, fields=fields, filter_expr=filter)
         return _resp
@@ -12757,10 +12887,14 @@ if _module_enabled("command"):
         async def lidarr_command_album_search(
             albumIds: list[int],
             confirm: bool = False,
+            wait: bool = False,
+            wait_timeout: int = 30,
         ) -> dict[str, Any] | list[Any] | str:
-            """Trigger a download search for specific albums. If unexpected errors occur, call lidarr_report_issue.
+            """Trigger a download search for specific albums. Set wait=True to poll until completion (default timeout 30s). If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            wait: If True, poll until the command completes, fails, or times out (default False).
+            wait_timeout: Max seconds to wait when wait=True (default 30).
             Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             albumIds: List of album IDs to search for downloads.
             """
@@ -12791,7 +12925,10 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_command_album_search",
                 }
-            return _compact_mutation_response(_resp)
+            _result = _compact_mutation_response(_resp)
+            if wait and isinstance(_resp, dict) and "id" in _resp:
+                return await _poll_command(_resp["id"], timeout=wait_timeout)
+            return _result
 
 if _module_enabled("command"):
     if not LIDARR_READ_ONLY:
@@ -12800,10 +12937,14 @@ if _module_enabled("command"):
         async def lidarr_command_artist_search(
             artistId: int,
             confirm: bool = False,
+            wait: bool = False,
+            wait_timeout: int = 30,
         ) -> dict[str, Any] | list[Any] | str:
-            """Trigger a download search for all monitored albums of an artist. If unexpected errors occur, call lidarr_report_issue.
+            """Trigger a download search for all monitored albums of an artist. Set wait=True to poll until completion (default timeout 30s). If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            wait: If True, poll until the command completes, fails, or times out (default False).
+            wait_timeout: Max seconds to wait when wait=True (default 30).
             Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             artistId: The artist ID to search for.
             """
@@ -12834,7 +12975,10 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_command_artist_search",
                 }
-            return _compact_mutation_response(_resp)
+            _result = _compact_mutation_response(_resp)
+            if wait and isinstance(_resp, dict) and "id" in _resp:
+                return await _poll_command(_resp["id"], timeout=wait_timeout)
+            return _result
 
 if _module_enabled("command"):
     if not LIDARR_READ_ONLY:
@@ -12843,10 +12987,14 @@ if _module_enabled("command"):
         async def lidarr_command_refresh_artist(
             artistId: int | None = None,
             confirm: bool = False,
+            wait: bool = False,
+            wait_timeout: int = 30,
         ) -> dict[str, Any] | list[Any] | str:
-            """Refresh artist metadata and album list from MusicBrainz. If unexpected errors occur, call lidarr_report_issue.
+            """Refresh artist metadata and album list from MusicBrainz. Set wait=True to poll until completion (default timeout 30s). If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            wait: If True, poll until the command completes, fails, or times out (default False).
+            wait_timeout: Max seconds to wait when wait=True (default 30).
             Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             artistId: Artist ID to refresh. Omit to refresh all.
             """
@@ -12878,7 +13026,10 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_command_refresh_artist",
                 }
-            return _compact_mutation_response(_resp)
+            _result = _compact_mutation_response(_resp)
+            if wait and isinstance(_resp, dict) and "id" in _resp:
+                return await _poll_command(_resp["id"], timeout=wait_timeout)
+            return _result
 
 if _module_enabled("command"):
     if not LIDARR_READ_ONLY:
@@ -12887,10 +13038,14 @@ if _module_enabled("command"):
         async def lidarr_command_rescan_artist(
             artistId: int | None = None,
             confirm: bool = False,
+            wait: bool = False,
+            wait_timeout: int = 30,
         ) -> dict[str, Any] | list[Any] | str:
-            """Rescan an artist's folder on disk for new or changed files. If unexpected errors occur, call lidarr_report_issue.
+            """Rescan an artist's folder on disk for new or changed files. Set wait=True to poll until completion (default timeout 30s). If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            wait: If True, poll until the command completes, fails, or times out (default False).
+            wait_timeout: Max seconds to wait when wait=True (default 30).
             Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             artistId: Artist ID to rescan. Omit to rescan all.
             """
@@ -12922,7 +13077,10 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_command_rescan_artist",
                 }
-            return _compact_mutation_response(_resp)
+            _result = _compact_mutation_response(_resp)
+            if wait and isinstance(_resp, dict) and "id" in _resp:
+                return await _poll_command(_resp["id"], timeout=wait_timeout)
+            return _result
 
 if _module_enabled("command"):
     if not LIDARR_READ_ONLY:
@@ -12930,10 +13088,14 @@ if _module_enabled("command"):
         @mcp.tool()
         async def lidarr_command_missing_album_search(
             confirm: bool = False,
+            wait: bool = False,
+            wait_timeout: int = 30,
         ) -> dict[str, Any] | list[Any] | str:
-            """Search for all missing (monitored, not downloaded) albums. If unexpected errors occur, call lidarr_report_issue.
+            """Search for all missing (monitored, not downloaded) albums. Set wait=True to poll until completion (default timeout 30s). If unexpected errors occur, call lidarr_report_issue.
 
             Requires confirm=True to execute. Set confirm=False to preview.
+            wait: If True, poll until the command completes, fails, or times out (default False).
+            wait_timeout: Max seconds to wait when wait=True (default 30).
             Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
             """
             if not confirm:
@@ -12962,5 +13124,8 @@ if _module_enabled("command"):
                     "message": str(exc)[:500],
                     "tool": "lidarr_command_missing_album_search",
                 }
-            return _compact_mutation_response(_resp)
+            _result = _compact_mutation_response(_resp)
+            if wait and isinstance(_resp, dict) and "id" in _resp:
+                return await _poll_command(_resp["id"], timeout=wait_timeout)
+            return _result
 

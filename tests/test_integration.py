@@ -462,6 +462,50 @@ async def test_grab_album_workflow(server: ModuleType) -> None:
                 )
 
 
+# ── Command polling ───────────────────────────────────────────────────────
+
+
+async def test_command_with_wait(server: ModuleType) -> None:
+    """Command with wait=True should poll and return a status."""
+    result = await server.lidarr_command_missing_album_search(
+        confirm=True, wait=True, wait_timeout=15,
+    )
+    assert isinstance(result, dict)
+    assert "commandId" in result
+    assert result["status"] in ("completed", "failed", "aborted", "timeout")
+
+
+# ── Batch album monitoring ──────────────────────────────────────────────────
+
+
+async def test_update_albums_monitored_preview(server: ModuleType) -> None:
+    """lidarr_update_albums_monitored with confirm=False returns preview."""
+    result = await server.lidarr_update_albums_monitored(
+        albumIds=[1, 2, 3], monitored=True, confirm=False,
+    )
+    assert isinstance(result, dict)
+    assert "preview" in result
+    assert result["albumIds"] == [1, 2, 3]
+    assert result["monitored"] is True
+
+
+# ── Metadata profile summary ────────────────────────────────────────────────
+
+
+async def test_metadata_profile_list_allowed_types(server: ModuleType) -> None:
+    """lidarr_list_metadata_profiles should return summarized type names."""
+    result = await server.lidarr_list_metadata_profiles()
+    assert isinstance(result, dict)
+    assert result["count"] >= 1, "Fresh Lidarr should have at least one metadata profile"
+    profile = result["data"][0]
+    # primaryAlbumTypes should be a list of strings (names), not "[N items]"
+    assert "primaryAlbumTypes" in profile
+    pat = profile["primaryAlbumTypes"]
+    assert isinstance(pat, list)
+    if pat:
+        assert isinstance(pat[0], str), f"Expected string type names, got {type(pat[0])}"
+
+
 async def test_normalize_unicode_helper(server: ModuleType) -> None:
     """_normalize_unicode replaces exotic chars with ASCII equivalents."""
     fn = server._normalize_unicode

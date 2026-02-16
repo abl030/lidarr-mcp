@@ -304,3 +304,39 @@ Deliverables:
 - `tests/test_integration.py`: 2 new integration tests.
 - `generated/server.py`: Regenerated with all changes (235 tools + grab_album).
 - Total tests: 145 (122 unit + 23 integration).
+
+### Issue #4: Agent UX — Batch Operations, Command Polling, Metadata Profiles, Monitor Consistency
+Status: COMPLETE
+
+Goal: Fix real-world friction points: batch album monitoring, fire-and-forget commands, metadata profile compaction, and artist/album monitor consistency.
+
+#### 4a — Artist/Album Monitor Consistency
+- `lidarr_monitor_album`: When setting `monitored=True`, auto-checks and monitors parent artists (required for soularr).
+- `lidarr_grab_album`: After monitoring album (Step 4b), ensures pre-existing parent artist is also monitored.
+- Workflow hint updated to document auto-monitoring behavior.
+
+#### 4b — `lidarr_update_albums_monitored` High-Level Tool
+Always-registered tool wrapping `PUT /api/v1/album/monitor` with artist consistency.
+Params: `albumIds`, `monitored`, `ensure_artist_monitored` (default True), `confirm`.
+Docstring points to `lidarr_grab_album` for full add+monitor+search workflow.
+Updated `lidarr_update_album` workflow hint to point to this batch tool.
+
+#### 4c — Async Command Polling (`wait` parameter)
+- `_poll_command` helper: polls `GET /api/v1/command/{id}` every 2s until completed/failed/aborted or timeout.
+- All command tools (`is_command` and `is_command_generic`) get `wait: bool = False` and `wait_timeout: int = 30` params.
+- When `wait=True`, polls after firing the command and returns `{"commandId": N, "status": "completed|failed|timeout", ...}`.
+- `_COMMAND_TYPES` descriptions updated to document wait/wait_timeout.
+
+#### 4d — Metadata Profile Summary
+- `_summarize_metadata_profile` helper: extracts allowed type/status names from `primaryAlbumTypes`, `secondaryAlbumTypes`, `releaseStatuses`.
+- `lidarr_list_metadata_profiles` flagged with `post_process = "metadata_profile"` in context_builder.
+- Template conditional: when `fields` is empty, uses summarizer instead of generic compaction.
+- Workflow hint documents summarized response format.
+
+Deliverables:
+- `templates/server.py.j2`: `_poll_command` helper, `_summarize_metadata_profile` helper, `lidarr_update_albums_monitored` tool, wait params in command rendering, artist-auto-monitor in `lidarr_monitor_album` + `lidarr_grab_album`, metadata profile post-processing.
+- `generator/context_builder.py`: Updated `_WORKFLOW_HINTS` (monitor_album, update_album, list_metadata_profiles), `is_command_generic` flag, `post_process` flag, wait docs in `_COMMAND_TYPES`.
+- `tests/test_issue4.py`: 17 new unit tests.
+- `tests/test_integration.py`: 3 new integration tests.
+- `generated/server.py`: Regenerated with all changes (235 tools + update_albums_monitored + grab_album).
+- Total tests: 165 (139 unit + 26 integration).

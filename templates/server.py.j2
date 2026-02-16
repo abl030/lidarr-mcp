@@ -172,6 +172,48 @@ def _filter_response(
 
 
 # ---------------------------------------------------------------------------
+# Command polling helper
+# ---------------------------------------------------------------------------
+
+async def _poll_command(command_id: int, timeout: int = 30) -> dict[str, Any]:
+    """Poll a command until completion/failure/abort or timeout."""
+    import asyncio as _asyncio
+    elapsed = 0
+    while elapsed < timeout:
+        try:
+            status = await _client.request("GET", f"/api/v1/command/{command_id}")
+            if isinstance(status, dict):
+                state = status.get("status", "").lower()
+                if state in ("completed", "failed", "aborted"):
+                    return {"commandId": command_id, "status": state, "body": _compact_object(status)}
+        except Exception:
+            pass
+        await _asyncio.sleep(2)
+        elapsed += 2
+    return {"commandId": command_id, "status": "timeout", "elapsed": elapsed}
+
+
+# ---------------------------------------------------------------------------
+# Metadata profile summarizer
+# ---------------------------------------------------------------------------
+
+def _summarize_metadata_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    """Summarize a metadata profile, extracting allowed type/status names."""
+    result: dict[str, Any] = {}
+    _TYPE_FIELDS = ("primaryAlbumTypes", "secondaryAlbumTypes", "releaseStatuses")
+    for k, v in profile.items():
+        if k in _TYPE_FIELDS and isinstance(v, list):
+            result[k] = [
+                item.get("albumType", {}).get("name", item.get("releaseStatus", {}).get("name", "?"))
+                for item in v
+                if isinstance(item, dict) and item.get("allowed")
+            ]
+        else:
+            result[k] = _compact_value(v)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # FastMCP Server
 # ---------------------------------------------------------------------------
 
@@ -410,6 +452,15 @@ async def lidarr_grab_album(
     except Exception as exc:
         return {"error": True, "step": "monitor_album", "albumId": album_id, "message": str(exc)[:500]}
 
+    # Step 4b: Ensure parent artist is monitored (required for soularr)
+    try:
+        _artist_data = await _client.request("GET", f"/api/v1/artist/{artist_id}")
+        if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
+            _artist_data["monitored"] = True
+            await _client.request("PUT", f"/api/v1/artist/{artist_id}", json_body=_artist_data)
+    except Exception:
+        pass  # Non-fatal: album is still monitored
+
     # Step 5: Trigger download search
     try:
         await _client.request("POST", "/api/v1/command", json_body={"name": "AlbumSearch", "albumIds": [album_id]})
@@ -424,6 +475,54 @@ async def lidarr_grab_album(
         "albumTitle": album_title,
         "status": "search_triggered",
     }
+
+
+@mcp.tool()
+async def lidarr_update_albums_monitored(
+    albumIds: list[int],
+    monitored: bool,
+    ensure_artist_monitored: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Batch-update monitored status for multiple albums in a single call.
+
+    Requires confirm=True to execute. Set confirm=False to preview.
+    albumIds: List of album IDs to update.
+    monitored: Whether to monitor (True) or unmonitor (False) the albums.
+    ensure_artist_monitored: When monitored=True, automatically monitor parent artists too (default True). Required for soularr and other automation tools.
+    confirm: Must be True to execute the update.
+    Returns {"ok": true, "count": N, "ids": [...]} on success.
+    For the full add+monitor+search workflow, use lidarr_grab_album instead.
+    If unexpected errors occur, call lidarr_report_issue.
+    """
+    if not confirm:
+        return {"preview": "PUT /api/v1/album/monitor", "confirm": "Set confirm=True to execute.", "albumIds": albumIds, "monitored": monitored}
+
+    try:
+        _resp = await _client.request("PUT", "/api/v1/album/monitor", json_body={"albumIds": albumIds, "monitored": monitored})
+    except httpx.HTTPStatusError as exc:
+        return {"error": True, "source": "lidarr_api", "status": exc.response.status_code, "message": exc.response.text[:500], "tool": "lidarr_update_albums_monitored"}
+    except httpx.RequestError as exc:
+        return {"error": True, "source": "network", "status": 0, "message": str(exc)[:500], "tool": "lidarr_update_albums_monitored"}
+
+    result = _compact_mutation_response(_resp)
+
+    # Auto-monitor parent artists when setting monitored=True
+    if monitored and ensure_artist_monitored and isinstance(_resp, list):
+        _artist_ids: set[int] = set()
+        for _alb in _resp:
+            if isinstance(_alb, dict) and "artistId" in _alb:
+                _artist_ids.add(_alb["artistId"])
+        for _aid in _artist_ids:
+            try:
+                _artist_data = await _client.request("GET", f"/api/v1/artist/{_aid}")
+                if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
+                    _artist_data["monitored"] = True
+                    await _client.request("PUT", f"/api/v1/artist/{_aid}", json_body=_artist_data)
+            except Exception:
+                pass  # Non-fatal
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -472,12 +571,20 @@ if _module_enabled("{{ tool.module }}"):
 {% if tool.method == "put" and "{id}" in tool.path %}
 {{ indent }}    merge: bool = True,
 {% endif %}
+{% if tool.is_command is defined and tool.is_command or tool.is_command_generic is defined and tool.is_command_generic %}
+{{ indent }}    wait: bool = False,
+{{ indent }}    wait_timeout: int = 30,
+{% endif %}
 {{ indent }}) -> dict[str, Any] | list[Any] | str:
 {{ indent }}    """{{ tool.description }}
 
 {{ indent }}    Requires confirm=True to execute. Set confirm=False to preview.
 {% if tool.method == "put" and "{id}" in tool.path %}
 {{ indent }}    merge: Auto-fetch current object and merge changes (default True). Set False to send only specified fields.
+{% endif %}
+{% if tool.is_command is defined and tool.is_command or tool.is_command_generic is defined and tool.is_command_generic %}
+{{ indent }}    wait: If True, poll until the command completes, fails, or times out (default False).
+{{ indent }}    wait_timeout: Max seconds to wait when wait=True (default 30).
 {% endif %}
 {{ indent }}    Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
 {% for p in tool.params %}
@@ -633,6 +740,18 @@ if _module_enabled("{{ tool.module }}"):
 {{ indent }}            "message": str(exc)[:500],
 {{ indent }}            "tool": "{{ tool.name }}",
 {{ indent }}        }
+{% if tool.post_process is defined and tool.post_process == "metadata_profile" %}
+{{ indent }}    if isinstance(_resp, list) and not fields:
+{{ indent }}        _summarized = [_summarize_metadata_profile(p) for p in _resp if isinstance(p, dict)]
+{{ indent }}        if filter:
+{{ indent }}            for pair in filter.split(","):
+{{ indent }}                pair = pair.strip()
+{{ indent }}                if "=" not in pair:
+{{ indent }}                    continue
+{{ indent }}                k, v = pair.split("=", 1)
+{{ indent }}                _summarized = [row for row in _summarized if str(row.get(k.strip())) == v.strip()]
+{{ indent }}        return {"summary": f"Found {len(_summarized)} items", "count": len(_summarized), "data": _summarized}
+{% endif %}
 {% if tool.is_list and tool.response_type == "array" %}
 {{ indent }}    if isinstance(_resp, list):
 {{ indent }}        return _filter_response(_resp, fields=fields, filter_expr=filter)
@@ -645,7 +764,28 @@ if _module_enabled("{{ tool.module }}"):
 {{ indent }}        filtered["pageSize"] = _resp.get("pageSize", 10)
 {{ indent }}        return filtered
 {% endif %}
-{% if tool.is_mutation %}
+{% if tool.name == "lidarr_monitor_album" %}
+{{ indent }}    # Auto-monitor parent artists when setting albums to monitored=True
+{{ indent }}    if _body.get("monitored") and isinstance(_resp, list):
+{{ indent }}        _artist_ids_to_check: set[int] = set()
+{{ indent }}        for _alb in _resp:
+{{ indent }}            if isinstance(_alb, dict) and "artistId" in _alb:
+{{ indent }}                _artist_ids_to_check.add(_alb["artistId"])
+{{ indent }}        for _aid in _artist_ids_to_check:
+{{ indent }}            try:
+{{ indent }}                _artist_data = await _client.request("GET", f"/api/v1/artist/{_aid}")
+{{ indent }}                if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
+{{ indent }}                    _artist_data["monitored"] = True
+{{ indent }}                    await _client.request("PUT", f"/api/v1/artist/{_aid}", json_body=_artist_data)
+{{ indent }}            except Exception:
+{{ indent }}                pass  # Non-fatal
+{{ indent }}    return _compact_mutation_response(_resp)
+{% elif tool.is_command is defined and tool.is_command or tool.is_command_generic is defined and tool.is_command_generic %}
+{{ indent }}    _result = _compact_mutation_response(_resp)
+{{ indent }}    if wait and isinstance(_resp, dict) and "id" in _resp:
+{{ indent }}        return await _poll_command(_resp["id"], timeout=wait_timeout)
+{{ indent }}    return _result
+{% elif tool.is_mutation %}
 {{ indent }}    return _compact_mutation_response(_resp)
 {% else %}
 {{ indent }}    return _resp

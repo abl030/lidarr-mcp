@@ -83,7 +83,9 @@ _WORKFLOW_HINTS: dict[str, str] = {
     ),
     "lidarr_monitor_album": (
         "Note: Call lidarr_create_command with name='AlbumSearch' to trigger"
-        " a download search."
+        " a download search. When setting monitored=True, this tool"
+        " automatically ensures the parent artist is also monitored"
+        " (required for soularr and other automation tools)."
     ),
     "lidarr_update_artist": (
         "Note: Call lidarr_create_command with name='RefreshArtist' after"
@@ -92,9 +94,15 @@ _WORKFLOW_HINTS: dict[str, str] = {
     "lidarr_update_album": (
         "Note: Call lidarr_create_command with name='RefreshArtist' after"
         " updating. Uses merge=True by default to auto-fetch the current object."
+        " For batch album monitoring, use lidarr_update_albums_monitored instead."
     ),
     "lidarr_delete_artist": (
         "Note: Files may remain on disk unless deleteFiles=True."
+    ),
+    "lidarr_list_metadata_profiles": (
+        "Note: Responses include summarized primaryAlbumTypes,"
+        " secondaryAlbumTypes, and releaseStatuses showing only"
+        " allowed type names instead of the full objects."
     ),
 }
 
@@ -105,6 +113,7 @@ _COMMAND_TYPES: list[dict[str, Any]] = [
         "command_name": "AlbumSearch",
         "description": (
             "Trigger a download search for specific albums."
+            " Set wait=True to poll until completion (default timeout 30s)."
             " If unexpected errors occur, call lidarr_report_issue."
         ),
         "params": [
@@ -125,6 +134,7 @@ _COMMAND_TYPES: list[dict[str, Any]] = [
         "command_name": "ArtistSearch",
         "description": (
             "Trigger a download search for all monitored albums of an artist."
+            " Set wait=True to poll until completion (default timeout 30s)."
             " If unexpected errors occur, call lidarr_report_issue."
         ),
         "params": [
@@ -145,6 +155,7 @@ _COMMAND_TYPES: list[dict[str, Any]] = [
         "command_name": "RefreshArtist",
         "description": (
             "Refresh artist metadata and album list from MusicBrainz."
+            " Set wait=True to poll until completion (default timeout 30s)."
             " If unexpected errors occur, call lidarr_report_issue."
         ),
         "params": [
@@ -165,6 +176,7 @@ _COMMAND_TYPES: list[dict[str, Any]] = [
         "command_name": "RescanFolders",
         "description": (
             "Rescan an artist's folder on disk for new or changed files."
+            " Set wait=True to poll until completion (default timeout 30s)."
             " If unexpected errors occur, call lidarr_report_issue."
         ),
         "params": [
@@ -185,6 +197,7 @@ _COMMAND_TYPES: list[dict[str, Any]] = [
         "command_name": "MissingAlbumSearch",
         "description": (
             "Search for all missing (monitored, not downloaded) albums."
+            " Set wait=True to poll until completion (default timeout 30s)."
             " If unexpected errors occur, call lidarr_report_issue."
         ),
         "params": [],
@@ -386,6 +399,14 @@ def build_context(spec: dict[str, Any]) -> dict[str, Any]:
         if "command" not in modules:
             modules["command"] = []
         modules["command"].append(cmd_type["name"])
+
+    # Flag lidarr_create_command as generic command (for wait param)
+    # Flag lidarr_list_metadata_profiles for post-processing
+    for tool in tools:
+        if tool["name"] == "lidarr_create_command":
+            tool["is_command_generic"] = True
+        if tool["name"] == "lidarr_list_metadata_profiles":
+            tool["post_process"] = "metadata_profile"
 
     # Wire quality profile env-var defaults for lidarr_create_artist
     _ENV_DEFAULTS = {
