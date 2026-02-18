@@ -180,7 +180,7 @@ def test_generic_create_command_has_wait():
     source = _get_generated_source()
     sig = _get_func_sig(source, "lidarr_create_command")
     assert "wait: bool = False" in sig
-    assert "wait_timeout: int = 30" in sig
+    assert "wait_timeout: int = 120" in sig
 
 
 def test_command_docstring_mentions_wait():

@@ -44,10 +44,11 @@ def _generate_content():
 
 
 def test_create_artist_has_workflow_hint():
-    """lidarr_create_artist should mention searching for commands after adding."""
+    """lidarr_create_artist should mention monitor shorthand and search_album."""
     ctx = _build()
     tool = next(t for t in ctx["tools"] if t["name"] == "lidarr_create_artist")
-    assert "lidarr_search_tools" in tool["description"]
+    assert "monitor" in tool["description"]
+    assert "lidarr_search_album" in tool["description"]
 
 
 def test_monitor_album_has_workflow_hint():
@@ -81,7 +82,7 @@ def test_workflow_hints_in_generated_docstrings():
     docstring_start = content.find('"""', match.end())
     docstring_end = content.find('"""', docstring_start + 3)
     docstring = content[docstring_start:docstring_end]
-    assert "lidarr_search_tools" in docstring
+    assert "lidarr_search_album" in docstring
 
 
 # ── 2b: Error source distinction ─────────────────────────────────────
@@ -230,11 +231,13 @@ def test_command_tools_present():
     """Dedicated command type tools should exist in context."""
     ctx = _build()
     cmd_tools = [t for t in ctx["tools"] if t.get("is_command")]
-    assert len(cmd_tools) == 5
+    assert len(cmd_tools) == 7
     cmd_names = {t["name"] for t in cmd_tools}
     assert "lidarr_command_album_search" in cmd_names
     assert "lidarr_command_artist_search" in cmd_names
     assert "lidarr_command_refresh_artist" in cmd_names
+    assert "lidarr_command_rename_files" in cmd_names
+    assert "lidarr_command_rename_artist" in cmd_names
     assert "lidarr_command_rescan_artist" in cmd_names
     assert "lidarr_command_missing_album_search" in cmd_names
 

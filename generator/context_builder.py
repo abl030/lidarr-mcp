@@ -71,15 +71,15 @@ _MUTATION_METHODS = {"post", "put", "patch", "delete"}
 # Workflow hints appended to mutation tool docstrings (BP #5)
 _WORKFLOW_HINTS: dict[str, str] = {
     "lidarr_create_artist": (
-        "Note: Call lidarr_search_tools with 'command' to find album search"
-        " commands after adding. Set addOptions.monitor to control which albums"
-        " are monitored: 'all', 'future', 'missing', 'existing', 'latest',"
-        " 'first', or 'none'. Default monitors entire discography."
-        " Warning: addOptions.monitor='none' may still mark albums as monitored"
+        "Note: Use the 'monitor' shorthand param instead of addOptions.monitor."
+        " Valid values: all, future, missing, existing, latest, first, none."
+        " Default monitors entire discography."
+        " Warning: monitor='none' may still mark albums as monitored"
         " (Lidarr API bug). Workaround: create artist, then batch-unmonitor"
         " albums, then selectively monitor. Or use lidarr_grab_album which"
         " handles this automatically. foreignArtistId accepts MusicBrainz"
         " artist IDs for direct creation when Lidarr search API is unavailable."
+        " Use lidarr_search_album to browse an artist's albums before adding."
     ),
     "lidarr_monitor_album": (
         "Note: Call lidarr_create_command with name='AlbumSearch' to trigger"
@@ -95,6 +95,12 @@ _WORKFLOW_HINTS: dict[str, str] = {
         "Note: Call lidarr_create_command with name='RefreshArtist' after"
         " updating. Uses merge=True by default to auto-fetch the current object."
         " For batch album monitoring, use lidarr_update_albums_monitored instead."
+        " To select a specific release, use lidarr_set_album_release."
+    ),
+    "lidarr_lookup_album": (
+        "Note: This endpoint only works with MusicBrainz release group IDs"
+        " (term=lidarr:MBID). For text-based album search, use"
+        " lidarr_search_album instead."
     ),
     "lidarr_delete_artist": (
         "Note: Files may remain on disk unless deleteFiles=True."
@@ -202,7 +208,81 @@ _COMMAND_TYPES: list[dict[str, Any]] = [
         ),
         "params": [],
     },
+    {
+        "name": "lidarr_command_rename_files",
+        "command_name": "RenameFiles",
+        "description": (
+            "Rename track files for an artist according to naming settings."
+            " Set wait=True to poll until completion (default timeout 120s,"
+            " may be slow on NFS)."
+            " If unexpected errors occur, call lidarr_report_issue."
+        ),
+        "params": [
+            {
+                "name": "artistId",
+                "type": "int",
+                "required": True,
+                "default": None,
+                "description": "The artist ID whose files to rename.",
+                "enum": None,
+                "location": "body",
+                "nullable": False,
+            },
+            {
+                "name": "files",
+                "type": "list[int]",
+                "required": True,
+                "default": None,
+                "description": "List of track file IDs to rename.",
+                "enum": None,
+                "location": "body",
+                "nullable": False,
+            },
+        ],
+    },
+    {
+        "name": "lidarr_command_rename_artist",
+        "command_name": "RenameArtist",
+        "description": (
+            "Rename artist folders according to naming settings."
+            " Set wait=True to poll until completion (default timeout 120s,"
+            " may be slow on NFS)."
+            " If unexpected errors occur, call lidarr_report_issue."
+        ),
+        "params": [
+            {
+                "name": "artistIds",
+                "type": "list[int]",
+                "required": True,
+                "default": None,
+                "description": "List of artist IDs whose folders to rename.",
+                "enum": None,
+                "location": "body",
+                "nullable": False,
+            },
+        ],
+    },
 ]
+
+# Synthetic extra params injected into specific tools
+_EXTRA_PARAMS: dict[str, list[dict[str, Any]]] = {
+    "lidarr_create_artist": [
+        {
+            "name": "monitor",
+            "type": "str",
+            "required": False,
+            "default": None,
+            "description": (
+                "Shorthand for addOptions.monitor. Valid values: all, future,"
+                " missing, existing, first, latest, none."
+                " When set, injects into addOptions automatically."
+            ),
+            "enum": None,
+            "location": "synthetic",
+            "nullable": False,
+        },
+    ],
+}
 
 # Paths to skip (non-API endpoints, catch-all routes, static content)
 _SKIP_PATHS = {
@@ -421,6 +501,12 @@ def build_context(spec: dict[str, Any]) -> dict[str, Any]:
             for param in tool["params"]:
                 if param["name"] in env_map:
                     param["env_default"] = env_map[param["name"]]
+
+    # Inject synthetic extra params
+    for tool in tools:
+        extra = _EXTRA_PARAMS.get(tool["name"])
+        if extra:
+            tool["params"].extend(extra)
 
     # Deduplicate tool names
     _deduplicate_tool_names(tools)

@@ -340,3 +340,42 @@ Deliverables:
 - `tests/test_integration.py`: 3 new integration tests.
 - `generated/server.py`: Regenerated with all changes (235 tools + update_albums_monitored + grab_album).
 - Total tests: 165 (139 unit + 26 integration).
+
+### Sprint 6: Close Issues #5–#9
+Status: COMPLETE
+
+Goal: Fix real-world friction from five open GitHub issues. All fixes are in the template/generator — no spec changes needed.
+
+#### #5 — `lidarr_create_command` body not merged into payload
+- Fixed `_body["body"] = body` → `_body.update(body)` in template for generic command tool.
+- Bumped `wait_timeout` default from 30 → 120 for the generic command tool (NFS renames are slow).
+- Added `lidarr_command_rename_files` (params: `artistId: int`, `files: list[int]`) and `lidarr_command_rename_artist` (params: `artistIds: list[int]`) dedicated command types.
+
+#### #6 — `create_artist` rejects `monitor` parameter
+- Added synthetic `monitor: str | None` param to `lidarr_create_artist` via `_EXTRA_PARAMS` in `context_builder.py`.
+- Template injects `monitor` value into `addOptions` dict when set.
+- Updated workflow hint to reference the new shorthand param.
+
+#### #7 — `lookup_album` returns 0 results
+- Added `lidarr_search_album` high-level tool (always-registered) that looks up an artist and filters their album list by title substring.
+- Updated `lidarr_lookup_album` docstring to explain it only works with MusicBrainz IDs and point to `lidarr_search_album`.
+- Updated `lidarr_grab_album` docstring to mention `lidarr_search_album` for preview/browsing.
+
+#### #8 — No way to select a specific release
+- Added `lidarr_set_album_release` high-level tool (always-registered).
+- Lists available releases when `releaseIndex` is omitted; selects a release when provided.
+- Updated `lidarr_update_album` and `lidarr_grab_album` workflow hints to mention this tool.
+
+#### #9 — `grab_album` fails without explicit qualityProfileId/rootFolderPath
+- Both `lidarr_grab_album` and `lidarr_create_artist` now auto-detect defaults from the API: if only 1 root folder exists, use its `path` and `defaultQualityProfileId`.
+- If multiple root folders exist and no default is specified, returns helpful error listing options.
+- Fixed monitoring bug: `lidarr_grab_album` now explicitly re-monitors the artist after create (Step 1b), since `addOptions.monitor="none"` may unset `artist.monitored`.
+
+Deliverables:
+- `templates/server.py.j2`: body merge fix, wait_timeout bump, `lidarr_search_album` tool, `lidarr_set_album_release` tool, monitor shorthand injection, rootfolder auto-detect, artist re-monitor after create.
+- `generator/context_builder.py`: `_EXTRA_PARAMS` for synthetic monitor param, `_COMMAND_TYPES` for RenameFiles/RenameArtist, updated `_WORKFLOW_HINTS` for create_artist/update_album/lookup_album.
+- `tests/test_sprint6.py`: 23 new unit tests.
+- `tests/test_sprint2.py`: Updated 3 tests for changed workflow hints and command count.
+- `tests/test_issue4.py`: Updated 1 test for changed wait_timeout default.
+- `generated/server.py`: Regenerated with all changes (237 tools + search_album + set_album_release).
+- Total tests: 188 (162 unit + 26 integration).
