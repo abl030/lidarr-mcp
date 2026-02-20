@@ -102,6 +102,11 @@ _WORKFLOW_HINTS: dict[str, str] = {
         " (term=lidarr:MBID). For text-based album search, use"
         " lidarr_search_album instead."
     ),
+    "lidarr_create_album": (
+        "Note: Requires full artist object in 'artist' field, plus images: [],"
+        " links: [], releases: [], media: []. For a simpler workflow, use"
+        " lidarr_grab_album with foreignAlbumId to create albums automatically."
+    ),
     "lidarr_delete_artist": (
         "Note: Files may remain on disk unless deleteFiles=True."
     ),
@@ -284,6 +289,15 @@ _EXTRA_PARAMS: dict[str, list[dict[str, Any]]] = {
     ],
 }
 
+# Error hints for POST error handlers — keyed by tool name
+_ERROR_HINTS: dict[str, str] = {
+    "lidarr_create_album": (
+        "POST /album requires full artist object in 'artist' field, plus"
+        " images: [], links: [], releases: [], media: []. Use"
+        " lidarr_grab_album with foreignAlbumId for a simpler workflow."
+    ),
+}
+
 # Paths to skip (non-API endpoints, catch-all routes, static content)
 _SKIP_PATHS = {
     "/",
@@ -438,6 +452,14 @@ def build_context(spec: dict[str, Any]) -> dict[str, Any]:
             # Flag lookup tools for unicode normalization
             is_lookup = "lookup" in path.split("/")
 
+            # Flag single-resource GET tools (GET with {id} in path, not list/mutation)
+            is_single_get = (
+                method == "get"
+                and not is_list
+                and not is_mutation
+                and "{id}" in path
+            )
+
             tool = {
                 "name": name,
                 "method": method,
@@ -447,6 +469,7 @@ def build_context(spec: dict[str, Any]) -> dict[str, Any]:
                 "is_mutation": is_mutation,
                 "is_list": is_list,
                 "is_lookup": is_lookup,
+                "is_single_get": is_single_get,
                 "response_type": response_type,
                 "description": description,
                 "tags": tags,
@@ -482,11 +505,15 @@ def build_context(spec: dict[str, Any]) -> dict[str, Any]:
 
     # Flag lidarr_create_command as generic command (for wait param)
     # Flag lidarr_list_metadata_profiles for post-processing
+    # Wire error hints onto POST tools
     for tool in tools:
         if tool["name"] == "lidarr_create_command":
             tool["is_command_generic"] = True
         if tool["name"] == "lidarr_list_metadata_profiles":
             tool["post_process"] = "metadata_profile"
+        error_hint = _ERROR_HINTS.get(tool["name"])
+        if error_hint:
+            tool["error_hint"] = error_hint
 
     # Wire quality profile env-var defaults for lidarr_create_artist
     _ENV_DEFAULTS = {

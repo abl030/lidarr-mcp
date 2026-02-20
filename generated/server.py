@@ -299,6 +299,7 @@ async def lidarr_grab_album(
     artist: str = "",
     album: str = "",
     foreignArtistId: str = "",
+    foreignAlbumId: str = "",
     qualityProfileId: int | None = None,
     metadataProfileId: int | None = None,
     rootFolderPath: str | None = None,
@@ -306,10 +307,11 @@ async def lidarr_grab_album(
 ) -> dict[str, Any]:
     """Grab a specific album: look up artist, add to library if missing, monitor the album, and trigger download search.
 
-    Requires confirm=True to execute. Set confirm=False to preview.
+    Requires confirm=True to execute. Set confirm=False to preview (performs read-only lookups).
     artist: Artist name to search for (e.g. "DJ Harrison"). Required unless foreignArtistId is provided.
     album: Album title to match (case-insensitive substring match, e.g. "ElectroSoul").
     foreignArtistId: MusicBrainz artist ID. Use this to bypass Lidarr's search API when it's unavailable.
+    foreignAlbumId: MusicBrainz release group ID. When the album isn't in Lidarr's metadata cache, provide this to create the album directly via POST /api/v1/album.
     qualityProfileId: Quality profile ID. Defaults to LIDARR_DEFAULT_QUALITY_PROFILE_ID env var, then auto-detects from root folders.
     rootFolderPath: Root folder path. Defaults to LIDARR_DEFAULT_ROOT_FOLDER env var, then auto-detects from root folders.
     metadataProfileId: Metadata profile ID. Defaults to 1.
@@ -318,9 +320,6 @@ async def lidarr_grab_album(
     Use lidarr_search_album to browse an artist's albums before grabbing. Use lidarr_set_album_release to select a specific release after grabbing.
     If unexpected errors occur, call lidarr_report_issue.
     """
-    if not confirm:
-        return {"preview": "grab_album workflow", "confirm": "Set confirm=True to execute.", "artist": artist, "album": album}
-
     # Resolve defaults from env vars
     if qualityProfileId is None and LIDARR_DEFAULT_QUALITY_PROFILE_ID:
         qualityProfileId = int(LIDARR_DEFAULT_QUALITY_PROFILE_ID)
@@ -345,6 +344,72 @@ async def lidarr_grab_album(
                     return {"error": True, "step": "resolve_defaults", "message": "Multiple root folders found. Specify rootFolderPath.", "options": _options}
         except Exception:
             pass  # Fall through — will fail at create_artist if still None
+
+    if not confirm:
+        # Rich preview: perform read-only lookups, no mutations
+        _preview: dict[str, Any] = {
+            "preview": "grab_album workflow",
+            "confirm": "Set confirm=True to execute.",
+            "artist": artist,
+            "album": album,
+            "qualityProfileId": qualityProfileId,
+            "rootFolderPath": rootFolderPath,
+            "metadataProfileId": metadataProfileId,
+        }
+        # Resolve artist
+        _preview_artist_id: int | None = None
+        _preview_artist_name: str = artist
+        _preview_foreign_id: str = foreignArtistId
+        if foreignArtistId:
+            try:
+                _existing = await _client.request("GET", "/api/v1/artist")
+                if isinstance(_existing, list):
+                    for _a in _existing:
+                        if isinstance(_a, dict) and _a.get("foreignArtistId") == foreignArtistId:
+                            _preview_artist_id = _a["id"]
+                            _preview_artist_name = _a.get("artistName", artist)
+                            break
+            except Exception:
+                pass
+            _preview["foreignArtistId"] = foreignArtistId
+            _preview["artistName"] = _preview_artist_name
+        elif artist:
+            try:
+                _lookup = await _client.request("GET", "/api/v1/artist/lookup", params={"term": _normalize_unicode(artist)})
+                if isinstance(_lookup, list) and len(_lookup) > 0:
+                    _best = _lookup[0]
+                    _preview_foreign_id = _best.get("foreignArtistId", "")
+                    _preview_artist_name = _best.get("artistName", artist)
+                    _preview["artistName"] = _preview_artist_name
+                    _preview["foreignArtistId"] = _preview_foreign_id
+                    # Check library
+                    _existing = await _client.request("GET", "/api/v1/artist")
+                    if isinstance(_existing, list):
+                        for _a in _existing:
+                            if isinstance(_a, dict) and _a.get("foreignArtistId") == _preview_foreign_id:
+                                _preview_artist_id = _a["id"]
+                                break
+            except Exception:
+                pass
+        _preview["artist_in_library"] = _preview_artist_id is not None
+        _preview["will_create_artist"] = _preview_artist_id is None
+        # Match album if artist is in library
+        if _preview_artist_id is not None and album:
+            try:
+                _albums = await _client.request("GET", "/api/v1/album", params={"artistId": _preview_artist_id})
+                if isinstance(_albums, list):
+                    _album_lower = album.lower()
+                    for _alb in _albums:
+                        if isinstance(_alb, dict) and _album_lower in _alb.get("title", "").lower():
+                            _preview["matched_album"] = _alb.get("title", "")
+                            _preview["matched_albumId"] = _alb.get("id")
+                            _preview["releaseDate"] = _alb.get("releaseDate", "")
+                            break
+                    if "matched_album" not in _preview:
+                        _preview["available_albums"] = [a.get("title", "?") for a in _albums if isinstance(a, dict)][:20]
+            except Exception:
+                pass
+        return _preview
 
     # Step 1: Resolve artist
     if not foreignArtistId and not artist:
@@ -436,15 +501,14 @@ async def lidarr_grab_album(
             except Exception as exc:
                 return {"error": True, "step": "create_artist", "message": str(exc)[:500]}
 
-    # Step 1b: Re-monitor artist after create (addOptions.monitor='none' may unset artist.monitored)
-    if _newly_created:
-        try:
-            _artist_data = await _client.request("GET", f"/api/v1/artist/{artist_id}")
-            if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
-                _artist_data["monitored"] = True
-                await _client.request("PUT", f"/api/v1/artist/{artist_id}", json_body=_artist_data)
-        except Exception:
-            pass  # Non-fatal
+    # Step 1b: Ensure artist is monitored (addOptions.monitor='none' may unset artist.monitored)
+    try:
+        _artist_data = await _client.request("GET", f"/api/v1/artist/{artist_id}")
+        if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
+            _artist_data["monitored"] = True
+            await _client.request("PUT", f"/api/v1/artist/{artist_id}", json_body=_artist_data)
+    except Exception:
+        pass  # Non-fatal
 
     # Step 2: List albums for this artist (retry — metadata refresh may be in progress)
     import asyncio as _asyncio
@@ -470,9 +534,34 @@ async def lidarr_grab_album(
             match = alb
             break
 
+    # Step 3b: If no match and foreignAlbumId provided, create album directly
+    if match is None and foreignAlbumId:
+        try:
+            _artist_obj = await _client.request("GET", f"/api/v1/artist/{artist_id}")
+            _new_album = await _client.request("POST", "/api/v1/album", json_body={
+                "foreignAlbumId": foreignAlbumId,
+                "title": album or foreignAlbumId,
+                "artistId": artist_id,
+                "artist": _artist_obj if isinstance(_artist_obj, dict) else {"id": artist_id},
+                "monitored": True,
+                "images": [],
+                "links": [],
+                "releases": [],
+                "media": [],
+            })
+            if isinstance(_new_album, dict) and "id" in _new_album:
+                match = _new_album
+        except httpx.HTTPStatusError as exc:
+            return {"error": True, "step": "create_album", "status": exc.response.status_code, "message": exc.response.text[:500]}
+        except Exception as exc:
+            return {"error": True, "step": "create_album", "message": str(exc)[:500]}
+
     if match is None:
         available = [a.get("title", "?") for a in albums if isinstance(a, dict)]
-        return {"error": True, "step": "match_album", "message": f"No album matching '{album}'.", "available_albums": available}
+        _msg = f"No album matching '{album}'."
+        if not foreignAlbumId:
+            _msg += " Provide foreignAlbumId (MusicBrainz release group ID) to create the album directly."
+        return {"error": True, "step": "match_album", "message": _msg, "available_albums": available}
 
     album_id = match["id"]
     album_title = match.get("title", album)
@@ -484,14 +573,13 @@ async def lidarr_grab_album(
         return {"error": True, "step": "monitor_album", "albumId": album_id, "message": str(exc)[:500]}
 
     # Step 4b: Ensure parent artist is monitored (required for soularr)
-    if not _newly_created:
-        try:
-            _artist_data = await _client.request("GET", f"/api/v1/artist/{artist_id}")
-            if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
-                _artist_data["monitored"] = True
-                await _client.request("PUT", f"/api/v1/artist/{artist_id}", json_body=_artist_data)
-        except Exception:
-            pass  # Non-fatal: album is still monitored
+    try:
+        _artist_data = await _client.request("GET", f"/api/v1/artist/{artist_id}")
+        if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
+            _artist_data["monitored"] = True
+            await _client.request("PUT", f"/api/v1/artist/{artist_id}", json_body=_artist_data)
+    except Exception:
+        pass  # Non-fatal: album is still monitored
 
     # Step 5: Trigger download search
     try:
@@ -775,7 +863,7 @@ if _module_enabled("album"):
             remoteCover: str | None = None,
             confirm: bool = False,
         ) -> dict[str, Any] | list[Any] | str:
-            """Create album If unexpected errors occur, call lidarr_report_issue.
+            """Create album If unexpected errors occur, call lidarr_report_issue. Note: Requires full artist object in 'artist' field, plus images: [], links: [], releases: [], media: []. For a simpler workflow, use lidarr_grab_album with foreignAlbumId to create albums automatically.
 
             Requires confirm=True to execute. Set confirm=False to preview.
             Returns compact response: single objects have nested data summarized, batch results return {"ok": true, "count": N, "ids": [...]}.
@@ -847,6 +935,7 @@ if _module_enabled("album"):
                     "status": exc.response.status_code,
                     "message": exc.response.text[:500],
                     "tool": "lidarr_create_album",
+                    "hint": "POST /album requires full artist object in 'artist' field, plus images: [], links: [], releases: [], media: []. Use lidarr_grab_album with foreignAlbumId for a simpler workflow.",
                 }
             except httpx.RequestError as exc:
                 return {
@@ -969,9 +1058,11 @@ if _module_enabled("album"):
     @mcp.tool()
     async def lidarr_get_album(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get album by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/album/{id}"
         try:
@@ -995,6 +1086,9 @@ if _module_enabled("album"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_album",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("album"):
@@ -1625,9 +1719,11 @@ if _module_enabled("artist"):
     @mcp.tool()
     async def lidarr_get_artist(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get artist by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/artist/{id}"
         try:
@@ -1651,6 +1747,9 @@ if _module_enabled("artist"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_artist",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("artist"):
@@ -1982,9 +2081,11 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_get_autotagging(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get autotagging by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/autotagging/{id}"
         try:
@@ -2008,6 +2109,9 @@ if _module_enabled("system"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_autotagging",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("system"):
@@ -2313,9 +2417,11 @@ if _module_enabled("calendar"):
     @mcp.tool()
     async def lidarr_get_calendar(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get calendar by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/calendar/{id}"
         try:
@@ -2339,6 +2445,9 @@ if _module_enabled("calendar"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_calendar",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("command"):
@@ -2489,9 +2598,11 @@ if _module_enabled("command"):
     @mcp.tool()
     async def lidarr_get_command(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get command by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/command/{id}"
         try:
@@ -2515,6 +2626,9 @@ if _module_enabled("command"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_command",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("command"):
@@ -2593,9 +2707,11 @@ if _module_enabled("config"):
     @mcp.tool()
     async def lidarr_get_config_downloadclient(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get config downloadclient by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/config/downloadclient/{id}"
         try:
@@ -2619,6 +2735,9 @@ if _module_enabled("config"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_config_downloadclient",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("config"):
@@ -2721,9 +2840,11 @@ if _module_enabled("config"):
     @mcp.tool()
     async def lidarr_get_config_host(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get config host by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/config/host/{id}"
         try:
@@ -2747,6 +2868,9 @@ if _module_enabled("config"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_config_host",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("config"):
@@ -2953,9 +3077,11 @@ if _module_enabled("config"):
     @mcp.tool()
     async def lidarr_get_config_indexer(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get config indexer by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/config/indexer/{id}"
         try:
@@ -2979,6 +3105,9 @@ if _module_enabled("config"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_config_indexer",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("config"):
@@ -3081,9 +3210,11 @@ if _module_enabled("config"):
     @mcp.tool()
     async def lidarr_get_config_mediamanagement(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get config mediamanagement by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/config/mediamanagement/{id}"
         try:
@@ -3107,6 +3238,9 @@ if _module_enabled("config"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_config_mediamanagement",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("config"):
@@ -3264,9 +3398,11 @@ if _module_enabled("config"):
     @mcp.tool()
     async def lidarr_get_config_metadataprovider(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get config metadataprovider by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/config/metadataprovider/{id}"
         try:
@@ -3290,6 +3426,9 @@ if _module_enabled("config"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_config_metadataprovider",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("config"):
@@ -3469,9 +3608,11 @@ if _module_enabled("config"):
     @mcp.tool()
     async def lidarr_get_config_naming(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get config naming by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/config/naming/{id}"
         try:
@@ -3495,6 +3636,9 @@ if _module_enabled("config"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_config_naming",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("config"):
@@ -3621,9 +3765,11 @@ if _module_enabled("config"):
     @mcp.tool()
     async def lidarr_get_config_ui(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get config ui by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/config/ui/{id}"
         try:
@@ -3647,6 +3793,9 @@ if _module_enabled("config"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_config_ui",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("config"):
@@ -3835,9 +3984,11 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_get_custom_filter(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get custom filter by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/customfilter/{id}"
         try:
@@ -3861,6 +4012,9 @@ if _module_enabled("system"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_custom_filter",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("system"):
@@ -4181,9 +4335,11 @@ if _module_enabled("quality"):
     @mcp.tool()
     async def lidarr_get_custom_format(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get custom format by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/customformat/{id}"
         try:
@@ -4207,6 +4363,9 @@ if _module_enabled("quality"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_custom_format",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("quality"):
@@ -4477,9 +4636,11 @@ if _module_enabled("quality"):
     @mcp.tool()
     async def lidarr_get_delay_profile(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get delay profile by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/delayprofile/{id}"
         try:
@@ -4503,6 +4664,9 @@ if _module_enabled("quality"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_delay_profile",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("quality"):
@@ -5171,9 +5335,11 @@ if _module_enabled("downloadclient"):
     @mcp.tool()
     async def lidarr_get_download_client(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get download client by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/downloadclient/{id}"
         try:
@@ -5197,6 +5363,9 @@ if _module_enabled("downloadclient"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_download_client",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("downloadclient"):
@@ -6291,9 +6460,11 @@ if _module_enabled("importlist"):
     @mcp.tool()
     async def lidarr_get_import_list(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get import list by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/importlist/{id}"
         try:
@@ -6317,6 +6488,9 @@ if _module_enabled("importlist"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_import_list",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("importlist"):
@@ -6568,9 +6742,11 @@ if _module_enabled("importlist"):
     @mcp.tool()
     async def lidarr_get_import_list_exclusion(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get import list exclusion by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/importlistexclusion/{id}"
         try:
@@ -6594,6 +6770,9 @@ if _module_enabled("importlist"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_import_list_exclusion",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("importlist"):
@@ -7226,9 +7405,11 @@ if _module_enabled("indexer"):
     @mcp.tool()
     async def lidarr_get_indexer(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get indexer by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/indexer/{id}"
         try:
@@ -7252,6 +7433,9 @@ if _module_enabled("indexer"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_indexer",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("indexer"):
@@ -7484,9 +7668,11 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_get_language(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get language by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/language/{id}"
         try:
@@ -7510,6 +7696,9 @@ if _module_enabled("system"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_language",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("system"):
@@ -8256,9 +8445,11 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_get_metadata(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get metadata by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/metadata/{id}"
         try:
@@ -8282,6 +8473,9 @@ if _module_enabled("system"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_metadata",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("system"):
@@ -8551,9 +8745,11 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_get_metadata_profile(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get metadata profile by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/metadataprofile/{id}"
         try:
@@ -8577,6 +8773,9 @@ if _module_enabled("system"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_metadata_profile",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("system"):
@@ -9279,9 +9478,11 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_get_notification(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get notification by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/notification/{id}"
         try:
@@ -9305,6 +9506,9 @@ if _module_enabled("system"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_notification",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("system"):
@@ -9642,9 +9846,11 @@ if _module_enabled("quality"):
     @mcp.tool()
     async def lidarr_get_quality_definition(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get quality definition by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/qualitydefinition/{id}"
         try:
@@ -9668,6 +9874,9 @@ if _module_enabled("quality"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_quality_definition",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("quality"):
@@ -9877,9 +10086,11 @@ if _module_enabled("quality"):
     @mcp.tool()
     async def lidarr_get_quality_profile(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get quality profile by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/qualityprofile/{id}"
         try:
@@ -9903,6 +10114,9 @@ if _module_enabled("quality"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_quality_profile",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("quality"):
@@ -10839,9 +11053,11 @@ if _module_enabled("release"):
     @mcp.tool()
     async def lidarr_get_release_profile(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get release profile by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/releaseprofile/{id}"
         try:
@@ -10865,6 +11081,9 @@ if _module_enabled("release"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_release_profile",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("release"):
@@ -11064,9 +11283,11 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_get_remote_path_mapping(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get remote path mapping by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/remotepathmapping/{id}"
         try:
@@ -11090,6 +11311,9 @@ if _module_enabled("system"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_remote_path_mapping",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("system"):
@@ -11398,9 +11622,11 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_get_root_folder(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get root folder by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/rootfolder/{id}"
         try:
@@ -11424,6 +11650,9 @@ if _module_enabled("system"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_root_folder",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("system"):
@@ -11960,9 +12189,11 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_get_system_task(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get system task by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/system/task/{id}"
         try:
@@ -11986,6 +12217,9 @@ if _module_enabled("system"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_system_task",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("system"):
@@ -12112,9 +12346,11 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_get_tags_detail(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get tags detail by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/tag/detail/{id}"
         try:
@@ -12138,6 +12374,9 @@ if _module_enabled("system"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_tags_detail",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("system"):
@@ -12145,9 +12384,11 @@ if _module_enabled("system"):
     @mcp.tool()
     async def lidarr_get_tag(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get tag by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/tag/{id}"
         try:
@@ -12171,6 +12412,9 @@ if _module_enabled("system"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_tag",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("system"):
@@ -12323,9 +12567,11 @@ if _module_enabled("track"):
     @mcp.tool()
     async def lidarr_get_track(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get track by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/track/{id}"
         try:
@@ -12349,6 +12595,9 @@ if _module_enabled("track"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_track",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("track"):
@@ -12513,9 +12762,11 @@ if _module_enabled("track"):
     @mcp.tool()
     async def lidarr_get_track_file(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get track file by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/trackfile/{id}"
         try:
@@ -12539,6 +12790,9 @@ if _module_enabled("track"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_track_file",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("track"):
@@ -12784,9 +13038,11 @@ if _module_enabled("wanted"):
     @mcp.tool()
     async def lidarr_get_wanted_cutoff(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get wanted cutoff by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/wanted/cutoff/{id}"
         try:
@@ -12810,6 +13066,9 @@ if _module_enabled("wanted"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_wanted_cutoff",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("wanted"):
@@ -12881,9 +13140,11 @@ if _module_enabled("wanted"):
     @mcp.tool()
     async def lidarr_get_wanted_missing(
         id: int,
+        fields: str = "",
     ) -> dict[str, Any] | list[Any] | str:
         """Get wanted missing by ID If unexpected errors occur, call lidarr_report_issue.
 
+        fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
         """
         _path = f"/api/v1/wanted/missing/{id}"
         try:
@@ -12907,6 +13168,9 @@ if _module_enabled("wanted"):
                 "message": str(exc)[:500],
                 "tool": "lidarr_get_wanted_missing",
             }
+        if fields and isinstance(_resp, dict):
+            _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+            return {k: v for k, v in _resp.items() if k in _field_set}
         return _resp
 
 if _module_enabled("calendar"):

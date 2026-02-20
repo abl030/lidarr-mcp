@@ -411,7 +411,7 @@ async def test_lookup_with_en_dash_does_not_crash(server: ModuleType) -> None:
 
 
 async def test_grab_album_confirm_false_preview(server: ModuleType) -> None:
-    """lidarr_grab_album with confirm=False returns a preview."""
+    """lidarr_grab_album with confirm=False returns a rich preview."""
     result = await server.lidarr_grab_album(
         artist="Metallica", album="Master of Puppets", confirm=False,
     )
@@ -419,6 +419,10 @@ async def test_grab_album_confirm_false_preview(server: ModuleType) -> None:
     assert "preview" in result
     assert result["artist"] == "Metallica"
     assert result["album"] == "Master of Puppets"
+    # Rich preview fields
+    assert "artist_in_library" in result
+    assert "will_create_artist" in result
+    assert "qualityProfileId" in result or "rootFolderPath" in result
 
 
 async def test_grab_album_workflow(server: ModuleType) -> None:
@@ -513,3 +517,65 @@ async def test_normalize_unicode_helper(server: ModuleType) -> None:
     assert fn("foo\u00a0bar") == "foo bar"  # NBSP → space
     assert fn("clean") == "clean"  # no-op for ASCII
     assert fn("zero\u200bwidth") == "zerowidth"  # ZWSP removed
+
+
+# ── Rich preview ──────────────────────────────────────────────────────────
+
+
+async def test_grab_album_preview_rich(server: ModuleType) -> None:
+    """Rich preview returns library/album/profile info."""
+    result = await server.lidarr_grab_album(
+        artist="Metallica", album="Master of Puppets", confirm=False,
+    )
+    assert isinstance(result, dict)
+    assert "preview" in result
+    assert "artist_in_library" in result
+    assert "will_create_artist" in result
+    # Should have resolved artist name from lookup
+    assert "artistName" in result or "artist" in result
+
+
+# ── Fields on single GET ──────────────────────────────────────────────────
+
+
+async def test_get_artist_fields_selection(server: ModuleType) -> None:
+    """fields param on single GET whitelists response keys."""
+    quality_profile_id, root_folder = await _get_setup_ids(server)
+
+    # Look up and create a temporary artist
+    lookup = await server.lidarr_lookup_artist(term="Björk")
+    assert isinstance(lookup, dict) and lookup["count"] > 0
+    foreign_id = lookup["data"][0]["foreignArtistId"]
+
+    # Clean up leftover
+    existing = await server.lidarr_list_artists(filter=f"foreignArtistId={foreign_id}")
+    if isinstance(existing, dict) and existing.get("count", 0) > 0:
+        for artist in existing["data"]:
+            await server.lidarr_delete_artist(
+                id=artist["id"], deleteFiles=True, confirm=True,
+            )
+
+    created: dict[str, Any] = await server.lidarr_create_artist(
+        artistName="Björk",
+        foreignArtistId=foreign_id,
+        qualityProfileId=quality_profile_id,
+        metadataProfileId=1,
+        rootFolderPath=root_folder,
+        monitored=False,
+        confirm=True,
+    )
+    assert isinstance(created, dict) and not created.get("error"), f"Create failed: {created}"
+    artist_id: int = created["id"]
+
+    try:
+        # Get with fields selection
+        result = await server.lidarr_get_artist(id=artist_id, fields="artistName,monitored")
+        assert isinstance(result, dict)
+        assert "artistName" in result
+        assert "id" in result  # always included
+        # Should not have extra keys beyond id + requested fields
+        assert set(result.keys()) <= {"id", "artistName", "monitored"}
+    finally:
+        await server.lidarr_delete_artist(
+            id=artist_id, deleteFiles=True, confirm=True,
+        )

@@ -299,6 +299,7 @@ async def lidarr_grab_album(
     artist: str = "",
     album: str = "",
     foreignArtistId: str = "",
+    foreignAlbumId: str = "",
     qualityProfileId: int | None = None,
     metadataProfileId: int | None = None,
     rootFolderPath: str | None = None,
@@ -306,10 +307,11 @@ async def lidarr_grab_album(
 ) -> dict[str, Any]:
     """Grab a specific album: look up artist, add to library if missing, monitor the album, and trigger download search.
 
-    Requires confirm=True to execute. Set confirm=False to preview.
+    Requires confirm=True to execute. Set confirm=False to preview (performs read-only lookups).
     artist: Artist name to search for (e.g. "DJ Harrison"). Required unless foreignArtistId is provided.
     album: Album title to match (case-insensitive substring match, e.g. "ElectroSoul").
     foreignArtistId: MusicBrainz artist ID. Use this to bypass Lidarr's search API when it's unavailable.
+    foreignAlbumId: MusicBrainz release group ID. When the album isn't in Lidarr's metadata cache, provide this to create the album directly via POST /api/v1/album.
     qualityProfileId: Quality profile ID. Defaults to LIDARR_DEFAULT_QUALITY_PROFILE_ID env var, then auto-detects from root folders.
     rootFolderPath: Root folder path. Defaults to LIDARR_DEFAULT_ROOT_FOLDER env var, then auto-detects from root folders.
     metadataProfileId: Metadata profile ID. Defaults to 1.
@@ -318,9 +320,6 @@ async def lidarr_grab_album(
     Use lidarr_search_album to browse an artist's albums before grabbing. Use lidarr_set_album_release to select a specific release after grabbing.
     If unexpected errors occur, call lidarr_report_issue.
     """
-    if not confirm:
-        return {"preview": "grab_album workflow", "confirm": "Set confirm=True to execute.", "artist": artist, "album": album}
-
     # Resolve defaults from env vars
     if qualityProfileId is None and LIDARR_DEFAULT_QUALITY_PROFILE_ID:
         qualityProfileId = int(LIDARR_DEFAULT_QUALITY_PROFILE_ID)
@@ -345,6 +344,72 @@ async def lidarr_grab_album(
                     return {"error": True, "step": "resolve_defaults", "message": "Multiple root folders found. Specify rootFolderPath.", "options": _options}
         except Exception:
             pass  # Fall through — will fail at create_artist if still None
+
+    if not confirm:
+        # Rich preview: perform read-only lookups, no mutations
+        _preview: dict[str, Any] = {
+            "preview": "grab_album workflow",
+            "confirm": "Set confirm=True to execute.",
+            "artist": artist,
+            "album": album,
+            "qualityProfileId": qualityProfileId,
+            "rootFolderPath": rootFolderPath,
+            "metadataProfileId": metadataProfileId,
+        }
+        # Resolve artist
+        _preview_artist_id: int | None = None
+        _preview_artist_name: str = artist
+        _preview_foreign_id: str = foreignArtistId
+        if foreignArtistId:
+            try:
+                _existing = await _client.request("GET", "/api/v1/artist")
+                if isinstance(_existing, list):
+                    for _a in _existing:
+                        if isinstance(_a, dict) and _a.get("foreignArtistId") == foreignArtistId:
+                            _preview_artist_id = _a["id"]
+                            _preview_artist_name = _a.get("artistName", artist)
+                            break
+            except Exception:
+                pass
+            _preview["foreignArtistId"] = foreignArtistId
+            _preview["artistName"] = _preview_artist_name
+        elif artist:
+            try:
+                _lookup = await _client.request("GET", "/api/v1/artist/lookup", params={"term": _normalize_unicode(artist)})
+                if isinstance(_lookup, list) and len(_lookup) > 0:
+                    _best = _lookup[0]
+                    _preview_foreign_id = _best.get("foreignArtistId", "")
+                    _preview_artist_name = _best.get("artistName", artist)
+                    _preview["artistName"] = _preview_artist_name
+                    _preview["foreignArtistId"] = _preview_foreign_id
+                    # Check library
+                    _existing = await _client.request("GET", "/api/v1/artist")
+                    if isinstance(_existing, list):
+                        for _a in _existing:
+                            if isinstance(_a, dict) and _a.get("foreignArtistId") == _preview_foreign_id:
+                                _preview_artist_id = _a["id"]
+                                break
+            except Exception:
+                pass
+        _preview["artist_in_library"] = _preview_artist_id is not None
+        _preview["will_create_artist"] = _preview_artist_id is None
+        # Match album if artist is in library
+        if _preview_artist_id is not None and album:
+            try:
+                _albums = await _client.request("GET", "/api/v1/album", params={"artistId": _preview_artist_id})
+                if isinstance(_albums, list):
+                    _album_lower = album.lower()
+                    for _alb in _albums:
+                        if isinstance(_alb, dict) and _album_lower in _alb.get("title", "").lower():
+                            _preview["matched_album"] = _alb.get("title", "")
+                            _preview["matched_albumId"] = _alb.get("id")
+                            _preview["releaseDate"] = _alb.get("releaseDate", "")
+                            break
+                    if "matched_album" not in _preview:
+                        _preview["available_albums"] = [a.get("title", "?") for a in _albums if isinstance(a, dict)][:20]
+            except Exception:
+                pass
+        return _preview
 
     # Step 1: Resolve artist
     if not foreignArtistId and not artist:
@@ -436,15 +501,14 @@ async def lidarr_grab_album(
             except Exception as exc:
                 return {"error": True, "step": "create_artist", "message": str(exc)[:500]}
 
-    # Step 1b: Re-monitor artist after create (addOptions.monitor='none' may unset artist.monitored)
-    if _newly_created:
-        try:
-            _artist_data = await _client.request("GET", f"/api/v1/artist/{artist_id}")
-            if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
-                _artist_data["monitored"] = True
-                await _client.request("PUT", f"/api/v1/artist/{artist_id}", json_body=_artist_data)
-        except Exception:
-            pass  # Non-fatal
+    # Step 1b: Ensure artist is monitored (addOptions.monitor='none' may unset artist.monitored)
+    try:
+        _artist_data = await _client.request("GET", f"/api/v1/artist/{artist_id}")
+        if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
+            _artist_data["monitored"] = True
+            await _client.request("PUT", f"/api/v1/artist/{artist_id}", json_body=_artist_data)
+    except Exception:
+        pass  # Non-fatal
 
     # Step 2: List albums for this artist (retry — metadata refresh may be in progress)
     import asyncio as _asyncio
@@ -470,9 +534,34 @@ async def lidarr_grab_album(
             match = alb
             break
 
+    # Step 3b: If no match and foreignAlbumId provided, create album directly
+    if match is None and foreignAlbumId:
+        try:
+            _artist_obj = await _client.request("GET", f"/api/v1/artist/{artist_id}")
+            _new_album = await _client.request("POST", "/api/v1/album", json_body={
+                "foreignAlbumId": foreignAlbumId,
+                "title": album or foreignAlbumId,
+                "artistId": artist_id,
+                "artist": _artist_obj if isinstance(_artist_obj, dict) else {"id": artist_id},
+                "monitored": True,
+                "images": [],
+                "links": [],
+                "releases": [],
+                "media": [],
+            })
+            if isinstance(_new_album, dict) and "id" in _new_album:
+                match = _new_album
+        except httpx.HTTPStatusError as exc:
+            return {"error": True, "step": "create_album", "status": exc.response.status_code, "message": exc.response.text[:500]}
+        except Exception as exc:
+            return {"error": True, "step": "create_album", "message": str(exc)[:500]}
+
     if match is None:
         available = [a.get("title", "?") for a in albums if isinstance(a, dict)]
-        return {"error": True, "step": "match_album", "message": f"No album matching '{album}'.", "available_albums": available}
+        _msg = f"No album matching '{album}'."
+        if not foreignAlbumId:
+            _msg += " Provide foreignAlbumId (MusicBrainz release group ID) to create the album directly."
+        return {"error": True, "step": "match_album", "message": _msg, "available_albums": available}
 
     album_id = match["id"]
     album_title = match.get("title", album)
@@ -484,14 +573,13 @@ async def lidarr_grab_album(
         return {"error": True, "step": "monitor_album", "albumId": album_id, "message": str(exc)[:500]}
 
     # Step 4b: Ensure parent artist is monitored (required for soularr)
-    if not _newly_created:
-        try:
-            _artist_data = await _client.request("GET", f"/api/v1/artist/{artist_id}")
-            if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
-                _artist_data["monitored"] = True
-                await _client.request("PUT", f"/api/v1/artist/{artist_id}", json_body=_artist_data)
-        except Exception:
-            pass  # Non-fatal: album is still monitored
+    try:
+        _artist_data = await _client.request("GET", f"/api/v1/artist/{artist_id}")
+        if isinstance(_artist_data, dict) and not _artist_data.get("monitored"):
+            _artist_data["monitored"] = True
+            await _client.request("PUT", f"/api/v1/artist/{artist_id}", json_body=_artist_data)
+    except Exception:
+        pass  # Non-fatal: album is still monitored
 
     # Step 5: Trigger download search
     try:
@@ -779,6 +867,8 @@ if _module_enabled("{{ tool.module }}"):
 {% if tool.is_list %}
 {{ indent }}    fields: str = "",
 {{ indent }}    filter: str = "",
+{% elif tool.is_single_get is defined and tool.is_single_get %}
+{{ indent }}    fields: str = "",
 {% endif %}
 {% for p in optional_params %}
 {% if p.env_default is defined and p.env_default %}
@@ -806,6 +896,8 @@ if _module_enabled("{{ tool.module }}"):
 {% if tool.is_list %}
 {{ indent }}    fields: Comma-separated field names to include (e.g. "title,artistId,monitored"). Always includes 'id'. Omit for auto-compacted results.
 {{ indent }}    filter: Comma-separated key=value pairs to filter rows (e.g. "monitored=true"). Matches on string equality.
+{% elif tool.is_single_get is defined and tool.is_single_get %}
+{{ indent }}    fields: Comma-separated field names to include in the response (e.g. "artistName,monitored,path"). Returns only specified fields when set.
 {% endif %}
 {{ indent }}    """
 {% endif %}
@@ -923,6 +1015,9 @@ if _module_enabled("{{ tool.module }}"):
 {% if tool.method == "put" %}
 {{ indent }}            "hint": "PUT requires the full object. Use merge=True to auto-fetch and merge.",
 {% endif %}
+{% if tool.error_hint is defined and tool.error_hint %}
+{{ indent }}            "hint": "{{ tool.error_hint }}",
+{% endif %}
 {{ indent }}        }
 {{ indent }}    except httpx.RequestError as exc:
 {{ indent }}        return {
@@ -979,6 +1074,11 @@ if _module_enabled("{{ tool.module }}"):
 {{ indent }}    return _result
 {% elif tool.is_mutation %}
 {{ indent }}    return _compact_mutation_response(_resp)
+{% elif tool.is_single_get is defined and tool.is_single_get %}
+{{ indent }}    if fields and isinstance(_resp, dict):
+{{ indent }}        _field_set = {f.strip() for f in fields.split(",")} | {"id"}
+{{ indent }}        return {k: v for k, v in _resp.items() if k in _field_set}
+{{ indent }}    return _resp
 {% else %}
 {{ indent }}    return _resp
 {% endif %}
